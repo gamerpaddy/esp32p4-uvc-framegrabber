@@ -32,7 +32,6 @@ The WiFi side uses an ESP32-C6 as a companion radio chip, since the P4 has no Wi
 - ESP32-P4 board with an ESP32-C6 (this project targets the JC-ESP32P4-M3)
 - A thermal camera module with a parallel (DVP) video output
 - The adapter and backpack boards in `hardware/`, in EasyEDA format
-<img width="472" height="463" alt="firefox_lFlo9up0VG" src="https://github.com/user-attachments/assets/cc29b83f-d3f9-41c4-9420-b7d1a3685859" />
 <img width="426" height="396" alt="dllhost_eG323UHLDy" src="https://github.com/user-attachments/assets/e4402bc7-16b3-49dc-9595-201dec9a8353" />
 
 <img width="1033" height="892" alt="i_view64_hrC4MG2juw" src="https://github.com/user-attachments/assets/e4b13157-1bfd-4292-b980-a05a3c9026eb" />
