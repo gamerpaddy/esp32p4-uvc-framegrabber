@@ -1,52 +1,72 @@
-# ESP32-P4 Thermal Camera UVC Bridge — AI Session Documentation
+# ESP32-P4 Thermal Camera Framegrabber — AI Session Documentation
 
 ## Project Goal
-Pure parallel-video-to-USB-UVC bridge. A 14-bit monochrome thermal camera outputs raw parallel video (DVP interface). The ESP32-P4 captures it via DVP and streams it as **Y16 uncompressed UVC** over USB to a host PC. **Zero processing on the ESP32** — no AGC, no encoding, no colormap. The host PC does all of that in Python/OpenCV.
+Capture a thermal camera's raw parallel (DVP) video on an ESP32-P4 and stream it
+to a PC as **Y16 uncompressed UVC**. The USB path does **zero processing**: no
+AGC, no encoding, no colormap, so the host receives the camera's real sensor
+counts. Host-side processing lives in `cam_viewer.py`.
+
+Secondary outputs, added later, DO process the image because they have to:
+- A **browser view over Wi-Fi** (MJPEG). Encodes because raw Y16 does not fit
+  the radio and no browser renders Y16.
+- A **UART control channel** to the camera, driven from the Python viewer.
 
 ---
 
 ## Hardware
 
-### Thermal Camera Interface
+### Camera
+A **Dali D8X3C** thermal module (see `hardware/`). It is a pure video source:
+it drives PCLK/HSYNC/VSYNC and has no I2C. Control is via UART only.
+
 | Signal | Value | Notes |
 |--------|-------|-------|
-| Data width | 14-bit monochrome | D[13:0], each pixel = thermal ADC count |
-| PCLK | ~15 MHz | Camera drives it (ESP32-P4 is slave) |
-| VSYNC | ~50 Hz | = frame rate |
-| HSYNC | ~14 kHz | 14000/50 = 280 total lines (active + blanking) |
-| Resolution | ~384×288 | 288×50=14400 Hz HSYNC, 15M/14400≈1042 clocks/line |
-| Data format | 14-bit unsigned, no I2C/control | Device is a pure video source |
+| Data width | 14-bit | D[13:0]; D14/D15 tied to GND so each captured `uint16_t` is already Y16 |
+| PCLK | ~15 MHz | Camera drives it; the P4 is a slave (`external_xtal=1` suppresses XCLK) |
+| VSYNC | ~50 Hz | One capture per VSYNC |
+| Resolution | 384x288 | |
 
-### GPIO Pin Assignments (user-confirmed, hardwired)
-| Signal | GPIO |
-|--------|------|
-| PCLK | 48 |
-| VSYNC | 49 |
-| HSYNC | 50 |
-| D0 (LSB, bit 0) | 15 |
-| D1 (bit 1) | 14 |
-| D2 (bit 2) | 13 |
-| D3 (bit 3) | 12 |
-| D4 (bit 4) | 11 |
-| D5 (bit 5) | 10 |
-| D6 (bit 6) | 9 |
-| D7 (bit 7) | 6 |
-| D8 (bit 8) | 5 |
-| D9 (bit 9) | 4 |
-| D10 (bit 10) | 3 |
-| D11 (bit 11) | 54 |
-| D12 (bit 12) | 53 |
-| D13 (MSB, bit 13) | 52 |
-| D14 | GND (not connected to ESP32) |
-| D15 | GND (not connected to ESP32) |
+**The source is interleaved.** It alternates two frame phases every VSYNC:
 
-DVP configured in **16-bit mode** (`cam_data_width=16`, `CAM_CTLR_COLOR_RGB565`). D14/D15 are grounded so each captured `uint16_t` = `0x0000 | thermal14`. This is natively Y16 format. No bit manipulation needed.
+- **even captures** = 8-bit visible-light video (values fit in the low 8 bits)
+- **odd captures**  = 14-bit thermal data (values >0xFF, baseline ~7000 counts)
+
+So the 50 Hz VSYNC rate yields a **real thermal rate of ~25 fps**. The camera's
+on-screen menu is only drawn into the 8-bit video phase, which is why the viewer
+switches phase when you press a menu key.
+
+### GPIO Pin Assignments
+
+**These are the values in `sdkconfig`, which is what the board actually uses.**
+The `default`s in `main/Kconfig.projbuild` are stale leftovers from an earlier
+board and do NOT match the hardware. Trust this table and `sdkconfig`.
+
+| Signal | GPIO | | Signal | GPIO |
+|--------|------|-|--------|------|
+| PCLK   | 30 | | D4  | 45 |
+| VSYNC  | 31 | | D5  | 46 |
+| HSYNC  | 32 | | D6  | 47 |
+| D0     | 41 | | D7  | 48 |
+| D1     | 42 | | D8  | 40 |
+| D2     | 43 | | D9  | 39 |
+| D3     | 44 | | D10 | 38 |
+|        |    | | D11 | 37 |
+|        |    | | D12 | 34 |
+|        |    | | D13 | 33 |
+| D14/D15 | GND | | | |
+
+| Other | Pins |
+|-------|------|
+| Camera UART1 | TX=29, RX=28 @ 38400 8N1 |
+| SDIO to C6 | CLK=18 CMD=19 D0..D3=14,15,16,17, reset=54 |
+| Console | USB-Serial-JTAG (NOT UART0: GPIO37/38 are DVP D11/D10) |
 
 ### Board
-- **SoC:** ESP32-P4 (dual-core RISC-V 400 MHz)
-- **PSRAM:** 32 MB (hex mode 200 MHz) — frame buffers live here
-- **USB:** High-Speed bulk via dedicated DP/DN pins + external USB PHY
-- **IDF version in use:** v6.0.1
+- **SoC:** ESP32-P4 (dual-core RISC-V, running at 360 MHz)
+- **PSRAM:** 32 MB hex mode 200 MHz — all frame buffers live here
+- **Radio:** on-module **ESP32-C6** over SDIO (the P4 has no Wi-Fi), via ESP-Hosted
+- **USB:** High-Speed bulk, external UTMI PHY
+- **IDF:** v6.0.1
 
 ---
 
@@ -54,333 +74,394 @@ DVP configured in **16-bit mode** (`cam_data_width=16`, `CAM_CTLR_COLOR_RGB565`)
 
 ### Data Flow
 ```
-Thermal cam → PCLK/VSYNC/HSYNC + D[13:0]
-  → esp_cam_ctlr_dvp (16-bit DMA)
-  → PSRAM frame buffer (uint16_t per pixel, bits[13:0] = thermal ADC)
-  → UVC transfer buffer (memcpy by TinyUSB driver)
-  → USB HS bulk → host PC
+Thermal cam ──DVP──> esp_cam_ctlr_dvp (16-bit DMA) ──> PSRAM buffer pool (6)
+                                                          │
+                        ┌─────────────────────────────────┤
+                        ▼                                 ▼
+              UVC task (prio 23)                  observer tap (memcpy)
+              raw Y16, no processing                      │
+                        │                                 ▼
+                        ▼                        mjpeg task (prio 5)
+                  USB HS bulk                    AGC -> HW JPEG -> HTTP
+                        │                                 │
+                        ▼                                 ▼
+                   PC (cam_viewer.py)              browser over Wi-Fi
 ```
 
-### Task Architecture
-| Task | Core | Priority | Role |
-|------|------|----------|------|
-| `UVC` (in usb_device_uvc.c) | Kconfig | configurable | Calls `on_fb_get()` → blocks on `ready_q`; calls `tud_video_n_frame_xfer()` |
-| `TinyUSB` (in usb_device_uvc.c) | Kconfig | configurable | Runs `tud_task()` loop |
-| DVP ISR callbacks | — | ISR | `on_get_new_trans` feeds DMA; `on_trans_finished` pushes to `ready_q` |
+### Tasks
+| Task | Prio | Role |
+|------|------|------|
+| `UVC` (usb_device_uvc.c) | 23 | `on_fb_get()` -> `camera_get_frame()`, `tud_video_n_frame_xfer()` |
+| `TinyUSB` | 24 | `tud_task()` loop |
+| `mjpeg` (web_stream.c) | 5 | One per HTTP stream client; AGC + JPEG + send |
+| `httpd` | default | Serves `/`, `/stats`, `/snapshot` |
+| `cam_uart` | — | UART1 RX pump for camera replies |
+| console REPL | low | `join`/`scan`/`sdiospeed`/`wifispeed`/`c6flash`/... |
+| DVP ISR callbacks | ISR | `on_get_new_trans`, `on_trans_finished`, both `IRAM_ATTR` |
 
-Note: there is **no capture task**. `esp_cam_ctlr_receive()` is not implemented by the IDF 6.x DVP driver — it is callback-only.
+There is **no capture task**. `esp_cam_ctlr_receive()` is not implemented by the
+IDF 6.x DVP driver; it is callback-only.
 
 ### Buffer Management (camera_pipeline.c)
-```
-free_q  [buf0, buf1]  ←───────────────────────────────────────────┐
-    │                                                               │
-    ▼ on_get_new_trans ISR pops void* from free_q                  │
-DVP DMA writes frame into buf                                      │
-    │ frame complete                                               │
-    ▼ on_trans_finished ISR                                        │
-ready_q  [void*]  (size=1, drops stale frame back to free_q)      │
-    │                                                              │
-    ▼ on_fb_get() (UVC task) pops                                 │
-UVC transmits buf over USB                                        │
-    │                                                             │
-on_fb_return() ────────────────────────────────────────────────►─┘
-```
-- Queues hold `void *` buffer pointers (not indices) — ISR-safe by value
-- `bk_buffer_dis = 0`: driver keeps a backup buffer; when `free_q` is empty the ISR lets `trans->buffer` stay NULL and the driver uses the backup. `on_trans_finished` detects backup frames (pointer not in `ctx->bufs[]`) and discards them
-- Both callbacks are `IRAM_ATTR` (required by the driver — validated at registration)
+
+**6 buffers, 2 READY slots.** Both numbers are load-bearing:
+
+- **6 buffers**: the driver calls `on_get_new_trans` (start the NEXT capture)
+  *before* `on_trans_finished` (publish the just-finished one), so up to five
+  buffers are spoken for at that instant and one more must be FREE.
+- **2 READY slots**: phases alternate every 20 ms. With a single slot the 8-bit
+  video capture evicts the thermal frame 20 ms after it lands, so a consumer
+  whose cycle exceeds 20 ms misses every other thermal frame and output halves
+  to 12.5 fps. Two slots give the consumer the full 40 ms phase period.
+
+States (`BUF_FREE/WRITING/READY/READING`) transition only under `ctx->lock`.
+
+### Phase selection is by CONTENT, not capture parity
+`parity_filter=true`, `keep_parity=1` are hardwired in `camera_open()`. The
+classifier counts pixels >0xFF over a subsample and takes a **majority** vote.
+An "any pixel >0xFF" test was not enough: a hot glowing object puts a few
+>0xFF pixels into the *video* frame, which let the video phase through and
+made the view flip whenever something got hot.
+
+### Capture buffer is taller than the image
+`DVP_VBLANK_CAPTURE_MARGIN = 64` extra lines. If the DMA buffer is exactly
+`w*h*2`, the descriptor chain ends at the last active line *before* the VSYNC
+EOF fires, so EOF lands with no active descriptor. That race caused intermittent
+freezes and diagonal frame-start shear. Oversizing means VSYNC is the only frame
+delimiter. Only the first `w*h*2` bytes are ever delivered.
+
+### Two watchdogs
+- **Freeze watchdog**: a camera FFC or PCLK/VSYNC glitch can wedge the CAM so it
+  keeps EOF-ing but redelivers stale buffers. Live sensor noise makes every real
+  frame's hash unique, so a hash repeating one of the last 8 means frozen.
+- **Hard-stall watchdog**: the CAM can stop issuing EOFs entirely. If
+  `dbg_finished` does not advance across two consecutive timeouts, stop/start.
+
+### Observer tap (camera_pipeline.c)
+A second *consumer* does not work. The UVC task at prio 23 calls straight back
+into `camera_get_frame()` after each transfer, so it claims every published
+buffer before the prio-5 HTTP task is scheduled. The web stream measured
+**exactly zero frames**, not a fair share.
+
+The tap instead **copies** the frame the primary consumer is already taking:
+`camera_tap_get()` sets a pending flag and blocks; `camera_get_frame()` does the
+memcpy on whoever is consuming. If nothing is consuming (no USB host attached)
+the tap never fills and returns false, and the caller falls back to
+`camera_get_frame()`, which is uncontended by definition in that case.
 
 ---
 
 ## File Map
 
-### Files You Own (main/)
+### main/
 | File | Purpose |
 |------|---------|
-| `Kconfig.projbuild` | Thermal geometry (width/height/fps) + all 17 DVP GPIO numbers |
-| `camera_pipeline.h` | `camera_ctx_t` struct + API: `camera_open/start/stop/get_frame/release_frame` |
-| `camera_pipeline.c` | DVP init (3-phase), ISR callbacks, queue-based double-buffering; no capture task |
-| `uvc_streaming.h` | `uvc_stream_ctx_t` — camera ctx + UVC fb + perf counters |
-| `uvc_streaming.c` | UVC callbacks: `on_stream_start/stop/fb_get/fb_return`; no processing |
-| `app_main.c` | `camera_init()` then `uvc_stream_init()` then returns |
-| `CMakeLists.txt` | `SRCS`: app_main, camera_pipeline, uvc_streaming. `PRIV_REQUIRES`: esp_driver_cam, esp_driver_gpio, espressif__tinyusb, usb_device_uvc, esp_timer, esp_hw_support |
-| `idf_component.yml` | Depends on `idf>=5.4` and local `usb_device_uvc`; **no esp_video** |
-| `uvc_controls.h/.c` | **NOT compiled** (not in SRCS). Dead code from old ISP design. Ignore. |
-| `uvc_descriptors.h` | **NOT used**. Dead code from old multi-format design. Ignore. |
+| `app_main.c` | camera_init -> uvc_stream_init -> camera_uart_start -> wifi_console_start -> web_stream_start |
+| `camera_pipeline.c/.h` | DVP 3-phase init, ISR callbacks, buffer pool, phase filter, watchdogs, observer tap |
+| `uvc_streaming.c/.h` | UVC callbacks; no processing; NO SIGNAL checkerboard when DVP is dry |
+| `camera_uart.c/.h` | UART1 channel to the camera; framed protocol (STX/len/payload/checksum/ETX) |
+| `web_stream.c/.h` | HTTP server: `/`, `/stream` (MJPEG), `/snapshot`, `/stats` |
+| `wifi_console.c/.h` | Wi-Fi bring-up over ESP-Hosted + console: `scan`/`join`/`leave`/`status` |
+| `net_bench.c` | `sdiospeed` and `wifispeed` throughput benchmarks |
+| `c6_debug.c` | `c6mon` (listen to C6 UART0), `c6boot` (reset, `-d` = download mode) |
+| `c6_flash.c` | `c6flash` — programs the C6 from the `c6_fw` partition |
+| `Kconfig.projbuild` | Geometry, phase filter, polarity, DVP pins. **Defaults are stale, see sdkconfig.** |
 
-### Files You Own (components/usb_device_uvc/tusb/)
+### components/usb_device_uvc/
 | File | Purpose |
 |------|---------|
-| `uvc_frame_config.h` | Defines `THERMAL_WIDTH/HEIGHT/FPS`, `Y16_FRAME_COUNT=1`, `uvc_get_frame_info()` — used by both `usb_device_uvc.c` and `uvc_streaming.c` |
-| `usb_descriptors.h` | Defines `TUD_VIDEO_CAPTURE_DESCRIPTOR_THERMAL_BULK` macro + `CONFIG_TOTAL_LEN` + `UVC_DESC_TOTAL_LEN`. **This is the real descriptor**, not `main/uvc_descriptors.h`. |
-| `usb_descriptors.c` | Calls `TUD_VIDEO_CAPTURE_DESCRIPTOR_THERMAL_BULK` for the config descriptor; string "Thermal Bridge" |
-| `tusb_config.h` | TinyUSB compile-time config (EP sizes, task priorities, HS mode) |
+| `tusb/uvc_frame_config.h` | `THERMAL_WIDTH/HEIGHT` (frame 1) + `THERMAL_WIDTH2/HEIGHT2` (frame 2), `Y16_FRAME_COUNT=2` |
+| `tusb/usb_descriptors.h` | `TUD_VIDEO_CAPTURE_DESCRIPTOR_THERMAL_BULK`, length constants. **The real descriptor.** |
+| `tusb/usb_descriptors.c` | Config descriptor; product string "Thermal Bridge" |
+| `usb_device_uvc.c` | TinyUSB + video task, Probe/Commit. Calls `usb_new_phy(USB_PHY_TARGET_UTMI)` before `tusb_init()` |
 
-### Component Files (components/usb_device_uvc/)
+### Host / tools
 | File | Purpose |
 |------|---------|
-| `CMakeLists.txt` | `REQUIRES esp_timer esp_hw_support`. Adds `tusb/` to TinyUSB's PUBLIC include dirs; compiles `tusb/usb_descriptors.c` as part of TinyUSB. |
-| `usb_device_uvc.c` | TinyUSB task + video task + Probe/Commit handling. Calls `usb_new_phy(USB_PHY_TARGET_UTMI)` before `tusb_init()` — required to enable the USB OTG-HS clock on ESP32-P4. |
-| `include/usb_device_uvc.h` | Public API: `uvc_device_config/init/deinit`, `uvc_fb_t`, `uvc_format_t`, `uvc_xu_set_default` |
+| `cam_viewer.py` | Tk viewer: palettes, AGC, histogram, PNG/TIFF save, camera UART control |
+| `tcp_sink.py` | TCP sink for `wifispeed` |
+| `tools/flash_all.ps1` | Build C6 -> pack -> flash P4 -> write `c6_fw` |
+| `tools/pack_c6_fw.py` | Packs the four C6 images into `build/c6_fw.bin` |
+| `hardware/` | EasyEDA PCB files: Dali-to-FFC adapter, ESP32-P4 backpack |
 
 ---
 
-## UVC Descriptor Design
+## UVC Descriptor
 
-### Format Advertised
-**Single format: Y16 uncompressed**
-- GUID: `59 31 36 20 00 00 10 00 80 00 00 AA 00 38 9B 71` (FourCC "Y16 ")
-- 16 bits per pixel, little-endian
-- Bits [13:0] = thermal ADC value (0–16383)
-- Bits [15:14] = always 0 (D14/D15 grounded)
-- One frame size: `THERMAL_WIDTH × THERMAL_HEIGHT` at `THERMAL_FPS`
+**Single format Y16, TWO frame sizes advertised.**
 
-### Descriptor Hierarchy (bulk, single alt-setting)
-```
-IAD
-VideoControl Interface
-  Camera Terminal (IT, no controls)
-  Processing Unit (PU, bmControls=0x00,0x00,0x00 — no controls)
-  Output Terminal (OT → PU)
-VideoStreaming Interface alt-0 (with bulk endpoint, 1 endpoint = bulk-only mode)
-  VS Input Header (bNumFormats=1, bControlSize=1)
-  Format 1: Y16 Uncompressed (GUID above)
-  Frame 1: THERMAL_WIDTH × THERMAL_HEIGHT @ THERMAL_FPS
-  Bulk Endpoint IN 0x81 (512 byte packets)
-```
+- GUID `59 31 36 20 00 00 10 00 80 00 00 AA 00 38 9B 71` ("Y16 ")
+- 16 bpp little-endian; bits [13:0] = thermal count, [15:14] always 0
+- Frame 1: `CONFIG_THERMAL_WIDTH x CONFIG_THERMAL_HEIGHT` (currently 384x288)
+- Frame 2: 384x288 (`THERMAL_WIDTH2/HEIGHT2`, hardcoded)
+- Bulk endpoint IN 0x81, single alt-setting
 
-### Key Length Constants (in usb_descriptors.h)
-```c
-VS_INPUT_HDR_LEN = 13 + UVC_NUM_FORMATS*1 = 14   // UVC_NUM_FORMATS=1
-VC_TOTAL_INNER_LEN = CAMERA_TERM + PU + OT        // no XU
-VS_TOTAL_INNER_LEN = FMT_UNCOMPR + 1*FRM_UNCOMPR_CONT
-UVC_DESC_TOTAL_LEN = IAD + STD_VC + CS_VC+1 + VC_INNER + STD_VS + VS_HDR + VS_INNER + 7
-CONFIG_TOTAL_LEN   = TUD_CONFIG_DESC_LEN + UVC_DESC_TOTAL_LEN
-```
+`on_stream_start()` takes whatever the host committed and calls
+`camera_set_resolution()`.
 
-### Y16 GUID Macro (defined in usb_descriptors.h)
-```c
-#define TUD_VIDEO_GUID_Y16 \
-    0x59U,0x31U,0x36U,0x20U,0x00U,0x00U,0x10U,0x00U, \
-    0x80U,0x00U,0x00U,0xAAU,0x00U,0x38U,0x9BU,0x71U
-```
+Both 384x288 and 640x480 camera models are supported, selected by
+`CONFIG_THERMAL_WIDTH/HEIGHT` in sdkconfig. What does NOT work is picking the
+other frame size at runtime: a host committing 640x480 against a 384-wide
+camera produces garbage, which is why `cam_viewer.py` offers only one entry.
+
+---
+
+## Wi-Fi (ESP-Hosted, C6 over SDIO)
+
+esp_hosted **3.0.1** on both sides; host and coprocessor versions must match
+exactly or the link never finishes handshaking. SDIO 4-bit @ 40 MHz, STREAM
+mode (not SW_AGGR — that needs an IDF carrying commit `4814514`).
+
+### Measured throughput
+
+| Test | Result |
+|------|--------|
+| `sdiospeed` disconnected (bus only) | **56.6 Mbit/s** |
+| `sdiospeed` connected (over the air) | **11.9 Mbit/s** |
+| `wifispeed` (TCP end to end) | ~3.5 Mbit/s when measured |
+
+The bus is not the limit. **The radio is**, and the current ceiling is largely
+the improvised antenna. Do not go looking for a firmware cause for the
+remaining gap.
+
+### Things that were tried and did NOT help
+Recorded so nobody burns another cycle on them:
+
+- **`WIFI_PS_NONE`**: worth keeping (bus-powered board), but it did not fix the
+  stall it was aimed at. The byte count came back *bit-identical* with PS off.
+- **Disabling SW coexistence** (`ESP_COEX_SW_COEXIST_ENABLE=n`, BT was already
+  off): 6.15 -> 6.21 Mbit/s. Noise. Kept because it is free.
+  Note `ESP_COEX_ENABLED` cannot be turned off; Kconfig forces it back to `y`.
+- **Queue depth beyond 64**: 128 measured 11.87 vs 11.69 Mbit/s. 64 is the knee.
+- **Channel change (11 -> 1)**: `sdiospeed` returned *exactly* 5184 frames on
+  both channels. Congestion was never the issue.
+
+### The one change that DID help
+`CONFIG_EH_TRANSPORT_CP_SDIO_RX_Q_SIZE` and the host TX queue, **20 -> 64**:
+host-to-air went **6.21 -> 11.87 Mbit/s**.
+
+Why: the host must see free slave buffers before writing a frame. When it does
+not, `sdio_is_write_buffer_available()` backs off with `usleep(400)`, +400 us per
+retry. IDF's `usleep` busy-waits below one tick but switches to `vTaskDelay`
+above it, so at 1000 Hz the third retry jumps straight from 800 us to 2 ms. That
+quantisation pinned TX at ~518 frames/s **regardless of frame size** (2.08 /
+4.13 / 6.21 Mbit/s at 500 / 1000 / 1500 B). Size-independence is the tell: a
+saturated radio would have dropped frames/s as frames got bigger.
+
+### Diagnosing a TCP stall
+A stall that reproduces **to the byte** (~68 KB, i.e. one send buffer, then no
+ACKs ever) is not the board. It was `tcp_sink.py` wedged on a half-open
+connection from a previous run: the PC kernel completes the handshake from the
+listen backlog so `connect()` succeeds, but no application ever calls `recv()`,
+the window shuts, and the sender stalls after exactly one buffer. `tcp_sink.py`
+now has an idle timeout so it recovers by itself.
+
+`wifispeed` prints the ESP-Hosted throttle state (`wifi_tx_throttling`). If that
+ever reads LATCHED, the C6 missed a STOP_THROTTLE and every STA frame is being
+silently dropped.
+
+---
+
+## Web Stream (web_stream.c)
+
+`/` viewer page, `/stream` MJPEG, `/snapshot` one JPEG, `/stats` JSON.
+
+### The stream MUST run in its own task
+`esp_http_server` dispatches every request from a **single task**, so a handler
+that never returns (which an endless multipart response is) blocks the whole
+server. Symptom: `/stats` worked in isolation but the index page showed nothing
+while video played. Fixed with `httpd_req_async_handler_begin()`, which detaches
+the request to an `mjpeg` task so httpd stays free.
+
+A browser reload opens the new stream before the old socket dies. Refusing it
+with 503 made a reloaded tab lag, because the old task kept running and kept
+taking frames. A new `/stream` now asks the incumbent to stop and waits for it.
+
+`max_open_sockets = 7`: the MJPEG response occupies a socket for its whole life
+while `/stats` polls beside it. Too few and `lru_purge` reclaims the stream to
+serve the polls reporting on it.
+
+### AGC must be percentile-clipped
+Min/max stretch does not work on this sensor. One dead pixel near 0 and one hot
+pixel near full scale pin the endpoints to the edges of the 14-bit space, so the
+scene (a few hundred counts around a ~7000 baseline) compresses into a narrow
+mid-grey band. It renders as "bright and low contrast, as if not normalised at
+all" while normalisation is in fact running.
+
+Now clips 0.5% off each tail via a 1024-bin histogram, matching `robust_range()`
+in `cam_viewer.py`. Clamping in the mapping loop is mandatory: clipped tails mean
+pixels outside `[lo,hi]` exist, and unsigned `(v - lo)` would wrap and speckle.
+
+JPEG encoding uses the **P4 hardware encoder** (`JPEG_ENCODE_IN_FORMAT_GRAY`),
+so it costs almost no CPU. The AGC pass is the expensive part.
+
+### /stats
+Per-core CPU load, internal heap, PSRAM, stream fps, uptime. Load comes from
+FreeRTOS run-time counters (already enabled, already esp_timer-backed, so the
+counters are microseconds and compare directly to wall time).
+`ulTaskGetRunTimeCounter()` is not exposed in this kernel build, so it walks
+`uxTaskGetSystemState()` and matches the idle handles from
+`xTaskGetIdleTaskHandleForCore()`. Load is measured *between* polls; the first
+reading is 0.
 
 ---
 
 ## Key Design Decisions
 
-1. **Y16 over MJPEG/H264**: Zero processing on ESP32. The host gets exact 14-bit thermal ADC counts. MJPEG would be lossy. H264 would be lossy.
-
-2. **16-bit DVP mode**: `cam_data_width=16` + `CAM_CTLR_COLOR_RGB565` makes the DMA transfer 2 bytes/pixel. D14/D15 are grounded so the captured words are already Y16-compatible. `external_xtal=1` suppresses XCLK output — the thermal cam drives PCLK itself. `HSYNC` maps to `de_io` (HREF/data-enable) because the IDF 6.x DVP driver has no separate HSYNC pin concept.
-
-3. **Drop stale frames, not new frames**: `ready_q` size=1 with drop-old policy. If UVC is momentarily slow, we prefer fresh thermal data over old data.
-
-4. **USB OTG-HS UTMI PHY must be initialized explicitly**: The managed TinyUSB's `dwc2_phy_init()` for ESP32-P4 is a no-op (source comment: "// maybe usb_utmi_hal_init()"). Without calling `usb_new_phy()` first, `dcd_init()` crashes with a load access fault at `0x50000048` (USB OTG-HS register base) because the peripheral clock is not enabled. Fix: call `usb_new_phy()` with `USB_PHY_TARGET_UTMI` / `USB_PHY_SPEED_HIGH` / `USB_OTG_MODE_DEVICE` in `uvc_device_init()` before `tusb_init()`. Store handle; call `usb_del_phy()` in deinit. Header: `esp_private/usb_phy.h`. The old `usb` component (IDF 5.x) is still gone — this uses the IDF 6.x `esp_hw_support` component.
-
-5. **No `esp_video` / V4L2**: The old project used the high-level V4L2 framework which requires I2C sensor init. We use `esp_cam_ctlr_dvp` directly — the lowest-level DVP API, no sensor init needed.
-
-6. **`camera_apply_isp_profile` removed**: Declared in old `camera_pipeline.h`, called from old `uvc_controls.c`. Both are gone. Don't re-add.
+1. **Y16 over MJPEG/H264 for USB**: zero processing, exact counts, nothing lossy.
+2. **16-bit DVP mode**: `cam_data_width=16` + `CAM_CTLR_COLOR_RGB565` gives
+   2 bytes/pixel; D14/D15 grounded so words are natively Y16.
+3. **Drop stale frames, not new ones**: prefer fresh thermal data.
+4. **USB OTG-HS UTMI PHY must be initialised explicitly**: managed TinyUSB's
+   `dwc2_phy_init()` for the P4 is a no-op, so `dcd_init()` faults at
+   `0x50000048` because the peripheral clock is off. Call `usb_new_phy()` with
+   `USB_PHY_TARGET_UTMI`/`HIGH`/`DEVICE` before `tusb_init()`.
+5. **No `esp_video`/V4L2**: that framework requires I2C sensor init. This camera
+   has no I2C, so `esp_cam_ctlr_dvp` is used directly.
+6. **Framing polarity is hardwired in `camera_open()`**, NOT taken from Kconfig:
+   `vsync_invert=true, de_mode=0, hsync_invert=false, pclk_invert=false`. The
+   Kconfig values (notably `DE_MODE=2`) are ignored. Runtime log confirms
+   `DE mode 0 / VSYNC invert = 1`.
 
 ---
 
 ## Build System Notes
 
-### IDF 6.0.1 Compatibility Issues Resolved
-| Issue | Root Cause | Fix Applied |
-|-------|-----------|-------------|
-| `Failed to resolve component 'usb'` | `usb` component reorganized in IDF 6.x | Removed `usb` from `REQUIRES` in `usb_device_uvc/CMakeLists.txt`; removed all `usb_phy.h` usage |
-| `has no member named 'queue_items'` / `has no member named 'io'` | IDF 6.x completely reorganized `esp_cam_ctlr_dvp_config_t` | Moved pins into separate `esp_cam_ctlr_dvp_pin_config_t pin_cfg`; removed `queue_items`; added `cam_data_width=16`, `output_data_color_type`, `external_xtal=1`, `bk_buffer_dis=1`; renamed `hsync→de_io`, `pclk→pclk_io`, `vsync→vsync_io` |
-| `invalid argument: data_width != CAM_CTLR_DATA_WIDTH_8` | Driver enforces 8-bit pin config, but hardware has 16 data inputs | Three-phase init: call `esp_cam_ctlr_dvp_init()` with 8-bit config (D0-D7) to pass validation + enable RCC, manually route D8-D13 via GPIO matrix, then call `esp_cam_new_dvp_ctlr()` with `pin_dont_init=1` + `cam_data_width=16` |
-| Load access fault at `0x50000048` in `dcd_init` / `dwc2_core_is_highspeed` | Managed TinyUSB `dwc2_phy_init()` for ESP32-P4 is a no-op — USB OTG-HS peripheral clock never enabled | Call `usb_new_phy()` with `USB_PHY_TARGET_UTMI` + `USB_PHY_SPEED_HIGH` before `tusb_init()` in `uvc_device_init()`; add `esp_hw_support` to `usb_device_uvc/CMakeLists.txt` REQUIRES |
-| `assert failed: "no new buffer, and no driver internal buffer"` in `esp_cam_ctlr_dvp_start_trans` | DVP driver is callback-only — `esp_cam_ctlr_receive()` has no implementation; driver needs a buffer at `start()` time | Removed blocking capture task; switched to ISR callbacks (`on_get_new_trans` / `on_trans_finished`, both `IRAM_ATTR`); set `bk_buffer_dis=0` so driver has backup buffer when `free_q` is momentarily empty |
-| `DVP callback registration failed: ESP_ERR_INVALID_STATE` | `esp_cam_ctlr_register_event_callbacks()` only succeeds when `dvp_fsm == INIT`; calling it after `esp_cam_ctlr_enable()` fails silently | Move callback registration to `camera_open()` — after `esp_cam_new_dvp_ctlr()` but BEFORE `esp_cam_ctlr_enable()` |
-
-### IDF 6.x DVP API Shape (confirmed against `esp_cam_ctlr_dvp.h` + runtime)
-The driver enforces `pin->data_width == CAM_CTLR_DATA_WIDTH_8` in the GPIO init path, even though the ESP32-P4 hardware exposes 16 data inputs in the GPIO matrix (`CAM_DATA_IN_PAD_IN0..15`). The required three-phase workaround in `camera_pipeline.c`:
+### The three-phase DVP init
+The IDF 6.x driver enforces `data_width == CAM_CTLR_DATA_WIDTH_8` in its GPIO
+init path even though the P4 exposes 16 data inputs in the GPIO matrix:
 
 ```c
-// Phase 1: 8-bit config passes validation, enables RCC clock, routes D0-D7 + controls
-#include "esp_private/esp_cam_dvp.h"   // esp_cam_ctlr_dvp_init()
-#include "esp_rom_gpio.h"
-#include "driver/gpio.h"
-#include "soc/gpio_sig_map.h"          // CAM_DATA_IN_PAD_IN8_IDX..13_IDX
-
-esp_cam_ctlr_dvp_pin_config_t pin_cfg = {
-    .data_width = CAM_CTLR_DATA_WIDTH_8,   // 8 = passes driver check
-    .data_io    = { D0..D7 GPIOs },
-    .vsync_io   = CONFIG_DVP_VSYNC_GPIO,
-    .de_io      = CONFIG_DVP_HSYNC_GPIO,   // HREF/HSYNC = data-enable
-    .pclk_io    = CONFIG_DVP_PCLK_GPIO,
-    .xclk_io    = GPIO_NUM_NC,
-};
-esp_cam_ctlr_dvp_init(0, CAM_CLK_SRC_DEFAULT, &pin_cfg);
-
-// Phase 2: manually route D8-D13 (same sequence the driver uses internally)
-gpio_set_direction(gpio, GPIO_MODE_INPUT);
-gpio_set_pull_mode(gpio, GPIO_FLOATING);
+// Phase 1: 8-bit config passes validation, enables RCC, routes D0-D7 + controls
+esp_cam_ctlr_dvp_init(0, CAM_CLK_SRC_DEFAULT, &pin_cfg);   // esp_private/esp_cam_dvp.h
+// Phase 2: manually route D8-D13 through the GPIO matrix
 esp_rom_gpio_connect_in_signal(gpio, CAM_DATA_IN_PAD_IN8_IDX + offset, false);
-// ... for D9..D13
-
-// Phase 3: create controller with 16-bit DMA, skip pin init (done above)
-esp_cam_ctlr_dvp_config_t dvp_cfg = {
-    .cam_data_width  = 16,    // DMA captures 16 bits per PCLK from 16 GPIO signals
-    .external_xtal   = 1,     // thermal cam drives PCLK
-    .pin_dont_init   = 1,     // we did GPIO init above
-    .pin             = NULL,
-    .bk_buffer_dis   = 0,     // keep driver backup buffer for when free_q is momentarily empty
-    .pin_dont_init   = 1,     // we did GPIO init above
-    .pin             = NULL,
-    // ... other fields
-};
-
-// Callbacks MUST be registered BEFORE esp_cam_ctlr_enable() — driver only
-// accepts registration when dvp_fsm == INIT; enable() advances the FSM past it.
-esp_cam_ctlr_evt_cbs_t cbs = {
-    .on_get_new_trans  = camera_get_new_trans_cb,   // IRAM_ATTR
-    .on_trans_finished = camera_trans_finished_cb,  // IRAM_ATTR
-};
-esp_cam_ctlr_register_event_callbacks(ctx->ctlr, &cbs, ctx);
-esp_cam_ctlr_enable(ctx->ctlr);
-
-// camera_start() just calls esp_cam_ctlr_start() — no task created
+// Phase 3: create the controller with 16-bit DMA, pin_dont_init=1, pin=NULL
+esp_cam_new_dvp_ctlr(&dvp_cfg, &ctx->ctlr);
 ```
 
-**Also add `esp_driver_gpio` to `main/CMakeLists.txt` PRIV_REQUIRES** for `driver/gpio.h`.
+Callbacks **must** be registered after `esp_cam_new_dvp_ctlr()` but **before**
+`esp_cam_ctlr_enable()`; registration only succeeds while `dvp_fsm == INIT`.
 
-### Potential Future Build Issues
-| Error | Likely Fix |
-|-------|-----------|
-| `TUD_VIDEO_DESC_EP_BULK` undefined | Check TinyUSB `video.h` for the correct bulk endpoint macro name |
-| `tusb_teardown` undefined | Delete the `tusb_teardown()` call in `uvc_device_deinit()` |
-| `MALLOC_CAP_DMA` rejected for PSRAM | On ESP32-P4, PSRAM is DMA-accessible; remove `MALLOC_CAP_DMA` flag if IDF rejects the combination |
+### Resolved IDF 6.0.1 issues
+| Issue | Fix |
+|-------|-----|
+| `Failed to resolve component 'usb'` | Reorganised in IDF 6.x; use `esp_hw_support` + `esp_private/usb_phy.h` |
+| `esp_cam_ctlr_dvp_config_t` members missing | Pins moved to `pin_cfg`; added `cam_data_width`, `external_xtal`, `bk_buffer_dis`; `hsync`->`de_io` |
+| `data_width != CAM_CTLR_DATA_WIDTH_8` | Three-phase init above |
+| Load fault at `0x50000048` in `dcd_init` | `usb_new_phy(USB_PHY_TARGET_UTMI)` before `tusb_init()` |
+| `assert "no new buffer, and no driver internal buffer"` | Driver is callback-only; use ISR callbacks, `bk_buffer_dis=0` |
+| DVP callback registration `ESP_ERR_INVALID_STATE` | Register before `esp_cam_ctlr_enable()` |
+| `WIFI_BW_HT40` undeclared | Renamed to `WIFI_BW40` in IDF 6.x |
+| No `HTTPD_503_SERVICE_UNAVAILABLE` | Not in `httpd_err_code_t`; use `httpd_resp_set_status(req, "503 ...")` |
 
-### Component Dependency Chain
+### Component dependencies
 ```
-main → esp_driver_cam    (DVP driver, esp_cam_ctlr_dvp.h, esp_private/esp_cam_dvp.h)
-     → esp_driver_gpio   (driver/gpio.h — for manual D8-D13 GPIO routing)
-     → espressif__tinyusb
-     → usb_device_uvc
-     → esp_timer
-     → esp_hw_support    (heap_caps)
-
-usb_device_uvc → esp_timer         (get_time_millis)
-              → esp_hw_support     (esp_private/usb_phy.h — usb_new_phy/usb_del_phy)
-              → espressif__tinyusb (tusb.h, tud_video_*, etc.)
+main -> esp_driver_cam, esp_driver_gpio, esp_driver_uart, esp_driver_jpeg,
+        espressif__tinyusb, usb_device_uvc, esp_timer, esp_hw_support, esp_mm,
+        esp_wifi, esp_netif, esp_event, nvs_flash, lwip, console,
+        esp_http_server, esp_partition, espressif__esp-serial-flasher
+usb_device_uvc -> esp_timer, esp_hw_support, espressif__tinyusb
 ```
+
+### sdkconfig is generated and gitignored
+`sdkconfig.defaults` (and `c6_firmware/sdkconfig.defaults`) are the source of
+truth. Editing `sdkconfig` alone is lost on a `fullclean`; editing
+`sdkconfig.defaults` alone has **no effect** while a `sdkconfig` already exists.
+When changing config, do both, then verify the value survived the rebuild.
 
 ---
 
-## Kconfig Symbols Reference
+## Build and Flash
 
+```powershell
+.\tools\flash_all.ps1 -Port COM30      # C6 build -> pack -> P4 flash -> write c6_fw
 ```
-CONFIG_THERMAL_WIDTH       default 384
-CONFIG_THERMAL_HEIGHT      default 288
-CONFIG_THERMAL_FPS         default 50
 
-CONFIG_DVP_PCLK_GPIO       default 48
-CONFIG_DVP_VSYNC_GPIO      default 49
-CONFIG_DVP_HSYNC_GPIO      default 50
-CONFIG_DVP_D0_GPIO  = 15   CONFIG_DVP_D7_GPIO  = 6
-CONFIG_DVP_D1_GPIO  = 14   CONFIG_DVP_D8_GPIO  = 5
-CONFIG_DVP_D2_GPIO  = 13   CONFIG_DVP_D9_GPIO  = 4
-CONFIG_DVP_D3_GPIO  = 12   CONFIG_DVP_D10_GPIO = 3
-CONFIG_DVP_D4_GPIO  = 11   CONFIG_DVP_D11_GPIO = 54
-CONFIG_DVP_D5_GPIO  = 10   CONFIG_DVP_D12_GPIO = 53
-CONFIG_DVP_D6_GPIO  = 9    CONFIG_DVP_D13_GPIO = 52
+Then program the C6 itself from the P4 console (the C6 has no USB of its own):
 ```
+idf.py -p COM30 monitor
+p4> c6boot -d      # confirm ROM download mode
+p4> c6flash        # ~15 s
+```
+Only needed when the C6 firmware changed. P4-only rebuild:
+`idf.py -p COM30 flash monitor`.
 
 ---
 
 ## Runtime Debugging
 
-### Serial Log on Success
+### Healthy boot
 ```
-I thermal_dvp: DVP open: 384x288 @50 fps, 221184 bytes/frame
-I thermal_dvp: DVP capture running
-I uvc_stream:  Thermal bridge ready: 384x288 Y16 @50 fps, 221184 B/frame
-I usbd_uvc:    Mount                        ← USB connected
-I usbd_uvc:    Commit: bFormatIndex=1 bFrameIndex=1 dwFrameInterval=200000
-I uvc_stream:  Stream start: 384x288 @50fps (Y16)
+thermal_dvp: VSYNC invert = 1 / DE mode 0 / HSYNC invert = 0 / PCLK invert = 0
+thermal_dvp: DVP open: 384x288 @50 fps out, 270336 bytes/frame, parity_filter=1 keep_parity=1
+uvc_stream:  Thermal bridge ready: 384x288 Y16 @50 fps, 221184 B/frame
+cam_uart:    UART1 up: TX=IO29 RX=IO28 @ 38400 8N1
+wifi_con:    Wi-Fi (C6 over SDIO) up in STA mode, power save off
+web_stream:  HTTP server up on :80
+usbd_uvc:    Mount / Commit / Starting: 384x288 @50fps
 ```
+Note 270336 (capture, includes the vblank margin) vs 221184 (delivered).
 
-### If No Frames Arrive — Diagnostic Counters
-
-`camera_pipeline.c` logs three ISR counters on every `frame timeout`:
+### No frames: the ISR counters
 ```
-W thermal_dvp: frame timeout — get_new=N finished_ours=N finished_backup=N
+W thermal_dvp: frame timeout — get_new=N finished=N no_free=N recv=N/N
 ```
+| `get_new` | `finished` | Meaning |
+|-----------|-----------|---------|
+| 0 | 0 | ISR never fires. Camera unpowered, or VSYNC polarity so wrong no frame boundary is seen. |
+| 1 | 0 | Started but never completed. PCLK toggling, no valid VSYNC. |
+| >1 | >1 | Captures work; the problem is downstream (consumer or phase filter). |
 
-| `get_new` | `finished_ours` | `finished_backup` | Meaning |
-|-----------|-----------------|-------------------|---------|
-| 0 | 0 | 0 | DMA ISR never fires. Camera not connected/powered, or VSYNC/PCLK polarity completely wrong so the DVP controller never detects a frame boundary. |
-| 1 | 0 | 0 | `on_get_new_trans` fired once (initial start), but frame never completed. PCLK toggling but no valid VSYNC, or PCLK count wrong. |
-| >1 | 0 | >0 | DMA completes but all frames land in backup buffer. `free_q` is always empty at callback time — logic bug in buffer management. |
-| >1 | >0 | any | Frames reach `ready_q` correctly — problem is in the consumer path (UVC side). |
+If `finished` climbs but a *viewer* sees nothing, suspect the consumer, not the
+DVP. That is exactly how the web stream's zero-frame bug presented.
 
-**VSYNC polarity:** The IDF DVP driver connects VSYNC with `inv=true` (GPIO-matrix inversion). If camera outputs active-HIGH VSYNC, the controller sees active-LOW, which may not match what the hardware expects. Try toggling VSYNC polarity by connecting it with `inv=false` in the `DVP_CAM_CONFIG_INPUT_PIN` call inside `esp_cam_ctlr_dvp_init()` — but that requires patching the private driver or pre-routing the pin with an inverted connection.
+### Console commands
+`scan` `join <ssid> [pass]` `leave` `status` `sdiospeed [-t s] [-l bytes]`
+`wifispeed <ip> [-t s]` `c6mon` `c6boot [-d]` `c6flash`
 
-**HSYNC vs HREF:** We map `CONFIG_DVP_HSYNC_GPIO` to `de_io` (data-enable, expected active-HIGH during valid pixels). If the camera outputs HREF (active-HIGH during valid data), this is correct. If it outputs classic HSYNC (narrow active-LOW pulse at line start), `de_io` sees mostly-LOW and the DVP captures nothing. In that case, set `de_io = GPIO_NUM_NC` and rely solely on VSYNC + pixel count for framing.
+`status` prints `phy: not reported by the coprocessor` — `esp_wifi_remote` does
+not marshal the `phy_*` bits or `rssi` across the RPC. An all-zero PHY line
+means "not forwarded", **not** "the link is 11b". Use `scan` for RSSI.
 
-**PCLK edge:** Data is sampled on rising PCLK by default. If the camera drives data on the rising edge and it should be sampled on the falling edge, try setting `byte_swap_en = true` in `dvp_cfg`.
-
-**Verify D14/D15:** Must be tied to GND (not floating — floating injects noise into bits[15:14]).
-
-### If Y16 Doesn't Show in Windows Camera App
-Windows Camera app won't display Y16. Use Python (see below) or VLC or OBS with a custom source.
+### Y16 in other apps
+Windows Camera will not display Y16. Use `cam_viewer.py`, or the web view.
+On Linux: `v4l2-ctl --set-fmt-video=pixelformat=Y16`.
 
 ---
 
-## Host PC Python Decode
+## Host Viewer (cam_viewer.py)
 
-```python
-import cv2
-import numpy as np
+Tk + OpenCV. Settings persist by rewriting the `SETTINGS` block in the file
+itself, no external config.
 
-W, H = 384, 288  # match CONFIG_THERMAL_WIDTH/HEIGHT
-
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)   # get raw bytes, no RGB conversion
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  W)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
-
-while True:
-    ret, raw = cap.read()
-    if not ret:
-        break
-
-    # raw is a flat byte array; interpret as uint16 little-endian
-    frame14 = np.frombuffer(raw, dtype='<u2').reshape(H, W)
-    frame14 = frame14 & 0x3FFF   # mask upper 2 zero bits (optional but explicit)
-
-    # Linear AGC for display
-    lo, hi = frame14.min(), frame14.max()
-    if hi > lo:
-        display = ((frame14 - lo) * 255 // (hi - lo)).astype(np.uint8)
-    else:
-        display = np.zeros((H, W), dtype=np.uint8)
-
-    # False color (optional)
-    color = cv2.applyColorMap(display, cv2.COLORMAP_INFERNO)
-
-    cv2.imshow('Thermal 14-bit', color)
-    if cv2.waitKey(1) == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
-```
-
-On Linux with V4L2: `cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)` and set format via `v4l2-ctl --set-fmt-video=pixelformat=Y16`.
+- The viewer's resolution list is pinned to **384x288**. The firmware supports
+  both 384x288 and 640x480 camera models (set `CONFIG_THERMAL_WIDTH/HEIGHT`),
+  but selecting the 640x480 frame at runtime against a 384-wide camera crashes,
+  so the picker was reduced to one entry rather than left as a trap. Switching
+  models is an sdkconfig change plus editing `RESOLUTIONS` here.
+- Histogram: log-scaled, selectable axis (Min/Max, Full range, Manual), and
+  **Bars or Line**. Gaps are interpolated across empty bins *between* populated
+  ones, because real values often land on a coarse lattice (8-bit mode, camera
+  gain steps) which otherwise renders as a picket fence. Tails outside the
+  occupied range are left empty since those genuinely are.
+- `robust_range()` trims `CLIP_PCT` off each tail. The firmware's web AGC
+  mirrors this; plain min/max looks broken (see Web Stream above).
+- Serial: pyserial leaves `.is_open` True on a handle whose device vanished, so
+  the read loop tears the port down on I/O error and a timer resyncs the button.
+  `Reload` recycles both video and serial. A deliberate Disconnect stays down.
+- Toolbar is two rows. On one row, left-packed widgets claim the width first and
+  Tk clips right-packed ones off the end, so the Save buttons vanished entirely
+  at the 560 px minimum width.
 
 ---
 
-## What Was Removed vs Original Project
-- OV5647 MIPI CSI camera → replaced with DVP thermal capture
-- ISP / Bayer demosaic / color correction → removed entirely
-- RTSP/Ethernet streaming → removed entirely
-- 3 UVC formats (UYVY + MJPEG + H264) → 1 format (Y16)
-- Extension Unit (ISP color profile XU) → removed
-- PU controls (brightness/contrast/hue/saturation/WB) → removed (bmControls=0)
-- `uvc_controls.c` → dead code, not compiled
-- `esp_video` V4L2 framework → replaced with `esp_driver_cam` directly
-- `esp_cam_sensor` component → removed (no I2C sensor)
-- Explicit USB PHY init with old `usb_new_phy()` API → replaced with `usb_new_phy(USB_PHY_TARGET_UTMI)` from `esp_private/usb_phy.h` (IDF 6.x); call moved into `uvc_device_init()` before `tusb_init()`
+## What Was Removed vs the Original Project
+- OV5647 MIPI CSI camera -> DVP thermal capture
+- ISP / Bayer demosaic / colour correction -> gone
+- RTSP/Ethernet streaming -> gone (replaced by the MJPEG HTTP view)
+- 3 UVC formats (UYVY + MJPEG + H264) -> 1 format (Y16), 2 frame sizes
+- Extension Unit and PU controls -> gone (`bmControls=0`)
+- `esp_video` V4L2 framework -> `esp_cam_ctlr_dvp` directly
+- `esp_cam_sensor` -> gone (no I2C sensor)
+- `main/uvc_controls.c` and `main/uvc_descriptors.h` -> deleted, do not re-add
