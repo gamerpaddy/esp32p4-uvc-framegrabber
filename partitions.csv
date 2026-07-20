@@ -1,0 +1,18 @@
+# ESP32-P4 partition table — 16 MB flash.
+#
+# The stock single-app table gave the app 1 MB, which Wi-Fi had already filled
+# to 82%. Two changes:
+#   factory  3 MB  — room for the UVC + DVP + Wi-Fi app with headroom
+#   c6_fw    2 MB  — the ESP32-C6 coprocessor images, kept OUT of the app so
+#                    the C6 firmware can be updated without rebuilding the P4,
+#                    and so a 1.1 MB blob is not linked into the binary.
+#
+# c6_fw holds a packed container (see tools/pack_c6_fw.py): a small index of
+# {flash_offset, size} entries followed by the bootloader / partition-table /
+# ota_data / app images that get written into the C6 over UART.
+#
+# Name,     Type, SubType,   Offset,    Size
+nvs,        data, nvs,       0x9000,    0x6000
+phy_init,   data, phy,       0xf000,    0x1000
+factory,    app,  factory,   0x10000,   0x300000
+c6_fw,      data, undefined, 0x310000,  0x200000

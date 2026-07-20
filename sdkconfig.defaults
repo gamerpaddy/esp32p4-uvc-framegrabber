@@ -1,0 +1,76 @@
+# ESP32-P4 thermal UVC bridge — deliberate config on top of IDF defaults.
+# Regenerates sdkconfig after `idf.py fullclean` or on a fresh checkout.
+
+# PSRAM (32MB hex mode on Olimex board) — frame buffers live here
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# Performance
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# USB Device - High Speed
+CONFIG_TINYUSB_RHPORT_HS=y
+CONFIG_TINYUSB_VIDEO_STREAMING_IFS=1
+
+# USB task: high priority on CPU1, video task on CPU0
+CONFIG_UVC_TINYUSB_TASK_PRIORITY=24
+CONFIG_UVC_TINYUSB_TASK_CORE=1
+CONFIG_UVC_CAM1_TASK_PRIORITY=23
+CONFIG_UVC_CAM1_TASK_CORE=0
+
+# FreeRTOS: 1000Hz tick for minimal scheduling latency
+CONFIG_FREERTOS_HZ=1000
+
+# ---------------------------------------------------------------------------
+# Wi-Fi via ESP-Hosted: the P4 has no radio, the on-module ESP32-C6 is the
+# coprocessor and SDIO is the link. Pins are the JC-ESP32P4-M3 wiring; they
+# happen to match Espressif's P4-Function-EV-Board preset, but are set
+# explicitly here so the board choice stays "none" and the wiring is visible.
+# None of these collide with the DVP pins (30-48) or camera UART1 (28/29).
+# ---------------------------------------------------------------------------
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_HOST_TRANSPORT_BUS_SDIO=y
+CONFIG_ESP_HOSTED_HOST_SDIO_PIN_CLK=18
+CONFIG_ESP_HOSTED_HOST_SDIO_PIN_CMD=19
+CONFIG_ESP_HOSTED_HOST_SDIO_PIN_D0=14
+CONFIG_ESP_HOSTED_HOST_SDIO_PIN_D1=15
+CONFIG_ESP_HOSTED_HOST_SDIO_PIN_D2=16
+CONFIG_ESP_HOSTED_HOST_SDIO_PIN_D3=17
+CONFIG_ESP_HOSTED_HOST_RESET_GPIO=54
+CONFIG_ESP_HOSTED_HOST_SDIO_BUS_WIDTH_4=y
+CONFIG_ESP_HOSTED_HOST_SDIO_CLK_KHZ=40000
+# Matches the CP side (see c6_firmware/sdkconfig.defaults for why 20 was not
+# enough): deeper queues so the host hits the tick-quantised credit backoff in
+# sdio_is_write_buffer_available() less often.
+CONFIG_ESP_HOSTED_HOST_SDIO_TX_Q_SIZE=64
+CONFIG_ESP_HOSTED_HOST_SDIO_RX_Q_SIZE=64
+
+# Wi-Fi needs NVS for calibration/config storage
+CONFIG_NVS_ENCRYPTION=n
+
+# ---------------------------------------------------------------------------
+# lwIP TCP windows, sized for the ESP-Hosted round trip.
+#
+# The stock 5760-byte send buffer caps throughput at window/RTT. ESP-Hosted
+# puts an SDIO round trip in series with the air, measured at ~14 ms RTT here,
+# which pinned TCP at ~3.3 Mbit/s regardless of signal strength (-51 dBm) or
+# CPU load. The bus itself does 55 Mbit/s, so the window was the whole story.
+# esp_hosted's own coprocessor example ships these same values commented out.
+# ---------------------------------------------------------------------------
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCP_SACK_OUT=y
+
+# Custom partition table: 3 MB app (Wi-Fi had filled the stock 1 MB to 82%)
+# plus a 2 MB c6_fw partition holding the ESP32-C6 coprocessor images.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Console on the built-in USB-Serial-JTAG port (logs + the esp_console REPL).
+# NOT UART0: that is GPIO37/38, which this board wires to DVP D11/D10, so a
+# UART console would drive a DVP data line while printing.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

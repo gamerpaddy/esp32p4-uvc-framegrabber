@@ -1,0 +1,163 @@
+menu "Thermal Camera"
+
+    menu "Sensor Geometry"
+
+        config THERMAL_WIDTH
+            int "Active width (pixels)"
+            default 640
+            help
+                Active pixel columns output by the thermal camera.
+
+        config THERMAL_HEIGHT
+            int "Active height (lines)"
+            default 480
+            help
+                Active scan lines per frame.
+
+        config THERMAL_FPS
+            int "Delivered/advertised UVC frame rate (fps)"
+            default 50
+            range 1 120
+            help
+                Frame rate streamed to the host over UVC.  The camera drives
+                VSYNC at ~50 Hz but emits two interleaved phases (even = 8-bit
+                video, odd = 14-bit thermal); the parity filter delivers one
+                phase, so the real output rate is half the VSYNC rate (~25 fps).
+
+    endmenu
+
+    menu "Interleaved Phase (A/B) Filter"
+
+        config THERMAL_PARITY_FILTER
+            bool "Enable interleaved-phase (A/B) parity filter"
+            default y
+            help
+                The source alternates two frame phases every VSYNC at 50 Hz:
+                even captures carry 8-bit visible video, odd captures carry
+                14-bit thermal data.  With the filter on, only one phase is
+                delivered, giving a steady ~25 fps of one consistent content
+                type.  Turn off to forward every capture (~50 fps, flickering
+                between the two phases).
+
+        config THERMAL_KEEP_PARITY
+            int "Default phase to keep (0 = 8-bit video, 1 = 14-bit thermal)"
+            default 1
+            range 0 1
+            help
+                Which interleaved phase to deliver by default.  Selected by
+                frame CONTENT (the thermal phase uses 14-bit values >255, the
+                video phase fits in 8 bits), so it never drifts.  Flip at
+                runtime via the A/B switch ('A'=video, 'B'=thermal, 'T'=toggle).
+
+    endmenu
+
+    menu "Framing Signal Polarity"
+
+        comment "Frames complete on the VSYNC edge. If NO frames arrive"
+        comment "(serial log: finished=0), flip VSYNC invert. These can also"
+        comment "be swept live from the console: V key = VSYNC, D key = DE mode."
+
+        config THERMAL_VSYNC_INVERT
+            bool "Invert VSYNC polarity"
+            default y
+            help
+                The IDF DVP driver normally wires VSYNC with GPIO-matrix
+                inversion (=y here).  If the controller never detects a frame
+                boundary (on_trans_finished never fires, log shows finished=0),
+                flip this.  Default n = no inversion, which is the opposite of
+                the driver default and the more common case for free-running
+                parallel video sources.
+
+        config THERMAL_HSYNC_INVERT
+            bool "Invert HSYNC polarity"
+            default y
+
+        config THERMAL_DE_MODE
+            int "Data-enable (DE) mode (0=HREF, 1=HREF inverted, 2=free-run)"
+            default 2
+            range 0 2
+            help
+                How the HSYNC pin gates valid pixels:
+                  0 = HREF, active-high during valid pixels (driver default)
+                  1 = HREF, inverted
+                  2 = free-run: ignore HSYNC, capture every PCLK between VSYNCs
+                If the image is sheared/garbled use mode 2; if blank, sweep with
+                the D key on the console.
+
+    endmenu
+
+    menu "DVP GPIO Pins"
+
+        comment "D0 = LSB (bit 0), D13 = MSB (bit 13).  D14/D15 must be tied to GND."
+
+        config DVP_PCLK_GPIO
+            int "PCLK GPIO"
+            default 48
+
+        config DVP_VSYNC_GPIO
+            int "VSYNC GPIO"
+            default 49
+
+        config DVP_HSYNC_GPIO
+            int "HSYNC GPIO"
+            default 50
+
+        config DVP_D0_GPIO
+            int "D0 GPIO  (bit  0)"
+            default 15
+
+        config DVP_D1_GPIO
+            int "D1 GPIO  (bit  1)"
+            default 14
+
+        config DVP_D2_GPIO
+            int "D2 GPIO  (bit  2)"
+            default 13
+
+        config DVP_D3_GPIO
+            int "D3 GPIO  (bit  3)"
+            default 12
+
+        config DVP_D4_GPIO
+            int "D4 GPIO  (bit  4)"
+            default 11
+
+        config DVP_D5_GPIO
+            int "D5 GPIO  (bit  5)"
+            default 10
+
+        config DVP_D6_GPIO
+            int "D6 GPIO  (bit  6)"
+            default 9
+
+        config DVP_D7_GPIO
+            int "D7 GPIO  (bit  7)"
+            default 6
+
+        config DVP_D8_GPIO
+            int "D8 GPIO  (bit  8)"
+            default 5
+
+        config DVP_D9_GPIO
+            int "D9 GPIO  (bit  9)"
+            default 4
+
+        config DVP_D10_GPIO
+            int "D10 GPIO (bit 10)"
+            default 3
+
+        config DVP_D11_GPIO
+            int "D11 GPIO (bit 11)"
+            default 54
+
+        config DVP_D12_GPIO
+            int "D12 GPIO (bit 12)"
+            default 53
+
+        config DVP_D13_GPIO
+            int "D13 GPIO (bit 13)"
+            default 52
+
+    endmenu
+
+endmenu

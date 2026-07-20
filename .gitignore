@@ -1,0 +1,27 @@
+# ESP-IDF build output
+build/
+c6_firmware/build/
+
+# Pulled by the IDF component manager on first build
+managed_components/
+c6_firmware/managed_components/
+
+# Generated from sdkconfig.defaults; the defaults files are the source of truth
+sdkconfig
+sdkconfig.old
+c6_firmware/sdkconfig
+c6_firmware/sdkconfig.old
+
+# Python
+__pycache__/
+*.pyc
+
+# Captures saved by the viewer
+thermal_*.png
+thermal_*.tif
+thermal_*.tiff
+
+# Local editor/tool settings
+.claude/
+.vscode/
+.clangd

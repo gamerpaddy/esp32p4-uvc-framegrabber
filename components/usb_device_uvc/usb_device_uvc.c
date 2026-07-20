@@ -1,0 +1,549 @@
+/*
+ * SPDX-FileCopyrightText: 2022-2025 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Forked from usb_device_uvc v1.2.0 to add multi-format support.
+ * Key change: tud_video_commit_cb uses bFormatIndex for per-format frame lookup.
+ */
+
+#include <string.h>
+#include <inttypes.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_timer.h"
+#include "esp_check.h"
+#include "esp_private/usb_phy.h"
+#include "tusb.h"
+#include "usb_device_uvc.h"
+#include "uvc_frame_config.h"
+
+static const char *TAG = "usbd_uvc";
+
+#define UVC_CAM_NUM 1
+
+#define TUSB_EVENT_EXIT         (1<<0)
+#define TUSB_EVENT_EXIT_DONE    (1<<1)
+#define UVC1_EVENT_EXIT         (1<<2)
+#define UVC1_EVENT_EXIT_DONE    (1<<3)
+
+typedef struct {
+    bool uvc_init[UVC_CAM_NUM];
+    uvc_format_t format[UVC_CAM_NUM];
+    uvc_device_config_t user_config[UVC_CAM_NUM];
+    TaskHandle_t uvc_task_hdl[UVC_CAM_NUM];
+    TaskHandle_t tusb_task_hdl;
+    uint32_t interval_ms[UVC_CAM_NUM];
+    EventGroupHandle_t event_group;
+    usb_phy_handle_t phy_handle;
+} uvc_device_t;
+
+static uvc_device_t s_uvc_device;
+
+static inline uint32_t get_time_millis(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static void tusb_device_task(void *arg)
+{
+    while (1) {
+        EventBits_t uxBits = xEventGroupGetBits(s_uvc_device.event_group);
+        if (uxBits & TUSB_EVENT_EXIT) {
+            ESP_LOGI(TAG, "TUSB task exit");
+            break;
+        }
+        tud_task();
+    }
+    xEventGroupSetBits(s_uvc_device.event_group, TUSB_EVENT_EXIT_DONE);
+    vTaskDelete(NULL);
+}
+
+void tud_mount_cb(void)
+{
+    ESP_LOGI(TAG, "Mount");
+}
+
+void tud_umount_cb(void)
+{
+    ESP_LOGI(TAG, "UN-Mount");
+}
+
+void tud_suspend_cb(bool remote_wakeup_en)
+{
+    (void)remote_wakeup_en;
+    if (s_uvc_device.user_config[0].stop_cb) {
+        s_uvc_device.user_config[0].stop_cb(s_uvc_device.user_config[0].cb_ctx);
+    }
+    ESP_LOGI(TAG, "Suspend");
+}
+
+void tud_resume_cb(void)
+{
+    ESP_LOGI(TAG, "Resume");
+}
+
+/*
+ * Video streaming task: polls TinyUSB streaming state, captures frames,
+ * copies into the UVC transfer buffer, and submits via tud_video_n_frame_xfer.
+ */
+static void video_task(void *arg)
+{
+    uint32_t frame_num = 0;
+    uvc_fb_t *pic = NULL;
+
+    while (1) {
+        EventBits_t uxBits = xEventGroupGetBits(s_uvc_device.event_group);
+        if (uxBits & UVC1_EVENT_EXIT) {
+            ESP_LOGI(TAG, "UVC task exit");
+            break;
+        }
+
+        if (!tud_video_n_streaming(0, 0)) {
+            frame_num = 0;
+            vTaskDelay(1);
+            continue;
+        }
+
+        /*
+         * NO dwFrameInterval pacing gate here. fb_get_cb blocks until the DVP
+         * delivers the next thermal frame, so the CAMERA is the pacer. The old
+         * gate slept in vTaskDelay(1) steps (10 ms at the default 100 Hz tick),
+         * quantizing the cycle and costing ~1 fps against the 25 fps source.
+         */
+        pic = s_uvc_device.user_config[0].fb_get_cb(s_uvc_device.user_config[0].cb_ctx);
+        if (!pic) {
+            ESP_LOGE(TAG, "Failed to capture picture");
+            continue;
+        }
+
+        /*
+         * ZERO-COPY: hand the capture buffer to TinyUSB directly. The video
+         * class only READS from it (memcpy per payload chunk into its
+         * internal endpoint buffer), so no DMA-alignment requirement applies
+         * to this buffer. The frame stays claimed (fb not returned) until the
+         * transfer completes — the previous full-frame memcpy into uvc_buffer
+         * cost 10-20 ms per frame at 640x480 (PSRAM->PSRAM) and capped the
+         * pipeline below the camera's 25 fps.
+         */
+        /*
+         * Drain any STALE completion notification before submitting. When the
+         * host stops/re-commits the stream mid-frame, videod resets its state
+         * and the aborted frame's final chunk still fires
+         * tud_video_frame_xfer_complete_cb — leaving a leftover notification.
+         * Without this drain, the wait below consumes that stale notification
+         * and returns one frame EARLY, forever: the buffer is released while
+         * the transfer is still in flight and every next frame_xfer is
+         * refused (halving throughput and risking torn frames).
+         */
+        ulTaskNotifyTake(pdTRUE, 0);
+
+        if (!tud_video_n_frame_xfer(0, 0, (void *)pic->buf, pic->len)) {
+            /*
+             * Refusal = previous frame still in flight. With a BULK stream the
+             * interface stays COMMITTED after the host app closes (there is no
+             * "un-commit"), so tud_video_n_streaming() can't detect an idle
+             * host — this refusal is the only signal. Drop the frame, back off
+             * on the completion notify (wakes early if the stuck transfer
+             * drains), and throttle the log to avoid 25 warnings/s.
+             */
+            s_uvc_device.user_config[0].fb_return_cb(pic, s_uvc_device.user_config[0].cb_ctx);
+            static uint32_t refused = 0;
+            if ((refused++ % 256u) == 0) {
+                ESP_LOGW(TAG, "frame_xfer refused (host idle?) — %" PRIu32 " frames dropped", refused);
+            }
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* Block until tud_video_frame_xfer_complete_cb notifies us; bail out
+         * if the host stops streaming mid-transfer, the task must exit, or
+         * the transfer wedges (1 s cap — a frame normally takes ~20 ms). */
+        uint32_t waited_ms = 0;
+        while (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50)) == 0) {
+            waited_ms += 50;
+            if (!tud_video_n_streaming(0, 0) || waited_ms >= 1000 ||
+                (xEventGroupGetBits(s_uvc_device.event_group) & UVC1_EVENT_EXIT)) {
+                break;
+            }
+        }
+        s_uvc_device.user_config[0].fb_return_cb(pic, s_uvc_device.user_config[0].cb_ctx);
+        ++frame_num;
+    }
+
+    xEventGroupSetBits(s_uvc_device.event_group, UVC1_EVENT_EXIT_DONE);
+    vTaskDelete(NULL);
+}
+
+void tud_video_frame_xfer_complete_cb(uint_fast8_t ctl_idx, uint_fast8_t stm_idx)
+{
+    (void)stm_idx;
+    xTaskNotifyGive(s_uvc_device.uvc_task_hdl[ctl_idx]);
+}
+
+/*
+ * Called when the USB host commits a video format via VS_COMMIT_CONTROL.
+ * This is where multi-format handling happens: we use bFormatIndex to
+ * determine which format (YUY2/MJPEG/H264) and look up the correct
+ * per-format frame table for resolution/fps.
+ */
+int tud_video_commit_cb(uint_fast8_t ctl_idx, uint_fast8_t stm_idx,
+                        video_probe_and_commit_control_t const *parameters)
+{
+    (void)stm_idx;
+
+    uint8_t fmt_idx = parameters->bFormatIndex;
+    uint8_t frm_idx = parameters->bFrameIndex;
+
+    ESP_LOGI(TAG, "Commit: bFormatIndex=%u bFrameIndex=%u dwFrameInterval=%" PRIu32,
+             fmt_idx, frm_idx, parameters->dwFrameInterval);
+
+    /* Look up frame info from per-format table */
+    const uvc_frame_info_t *fi = uvc_get_frame_info(fmt_idx, frm_idx);
+    if (!fi) {
+        ESP_LOGE(TAG, "Invalid format/frame index: %u/%u", fmt_idx, frm_idx);
+        return VIDEO_ERROR_OUT_OF_RANGE;
+    }
+
+    /* Map bFormatIndex to uvc_format_t */
+    uvc_format_t format;
+    switch (fmt_idx) {
+    case 1:  format = UVC_FORMAT_UNCOMPR; break;
+    case 2:  format = UVC_FORMAT_JPEG;    break;
+    case 3:  format = UVC_FORMAT_H264;    break;
+    default: return VIDEO_ERROR_OUT_OF_RANGE;
+    }
+
+    s_uvc_device.format[ctl_idx] = format;
+    s_uvc_device.interval_ms[ctl_idx] = parameters->dwFrameInterval / 10000;
+
+    ESP_LOGI(TAG, "Starting: %ux%u @%ufps format=%d",
+             fi->width, fi->height, fi->max_fps, format);
+
+    esp_err_t ret = s_uvc_device.user_config[ctl_idx].start_cb(
+        format, fi->width, fi->height, fi->max_fps,
+        s_uvc_device.user_config[ctl_idx].cb_ctx);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "start_cb failed: %s", esp_err_to_name(ret));
+        return VIDEO_ERROR_OUT_OF_RANGE;
+    }
+    return VIDEO_ERROR_NONE;
+}
+
+/*
+ * ---- Processing Unit (PU) control handling ----
+ *
+ * UVC PU controls allow the host to adjust image parameters like
+ * brightness/contrast via v4l2-ctl. TinyUSB's video class has no
+ * built-in PU support, so we handle entity-level control requests
+ * via the tud_video_entity_control_xfer_cb weak callback.
+ *
+ * Each control is 2 bytes (int16_t). The host issues GET_CUR/MIN/MAX/
+ * RES/DEF/INFO and SET_CUR requests.
+ */
+
+/* UVC PU control selectors (UVC 1.5 spec Table A-12) */
+#define PU_BRIGHTNESS_CONTROL               0x02
+#define PU_CONTRAST_CONTROL                 0x03
+#define PU_HUE_CONTROL                      0x06
+#define PU_SATURATION_CONTROL               0x07
+#define PU_SHARPNESS_CONTROL                 0x04
+#define PU_WHITE_BALANCE_TEMPERATURE_CONTROL 0x0A
+#define PU_GAIN_CONTROL                      0x10
+
+/* Must match UVC_ENTITY_PROCESSING_UNIT in usb_descriptors.h */
+#define PU_ENTITY_ID  0x02
+
+typedef struct {
+    uint8_t  cs;
+    int16_t  cur;
+    int16_t  min;
+    int16_t  max;
+    int16_t  res;
+    int16_t  def;
+} pu_control_t;
+
+static pu_control_t s_pu_controls[] = {
+    { PU_BRIGHTNESS_CONTROL,               0,    -127, 127, 1, 0   },
+    { PU_CONTRAST_CONTROL,                 128,  0,    256, 1, 128  },
+    { PU_HUE_CONTROL,                      0,    0,    255, 1, 0    },
+    { PU_SATURATION_CONTROL,               128,  0,    256, 1, 128  },
+    { PU_SHARPNESS_CONTROL,                 40,  0,    100, 1, 40   },  /* ISP sharpen h_thresh */
+    { PU_WHITE_BALANCE_TEMPERATURE_CONTROL, 3,   0,    5,   1, 3    },  /* ISP profile index */
+    { PU_GAIN_CONTROL,                      8,   0,    20,  1, 8    },  /* BF denoise level (0=off) */
+};
+#define PU_CONTROL_COUNT (sizeof(s_pu_controls) / sizeof(s_pu_controls[0]))
+
+static int16_t s_pu_set_buf;  /* receive buffer for SET_CUR data stage */
+
+/* Weak callback: application overrides to bridge PU controls to hardware */
+TU_ATTR_WEAK void uvc_pu_control_set_cb(uint8_t cs, int16_t value)
+{
+    (void)cs; (void)value;
+}
+
+/*
+ * ---- Extension Unit (XU) control handling ----
+ *
+ * XU controls allow vendor-specific parameters (here: ISP color profile).
+ * Each control is 1 byte (uint8_t). Same GET/SET pattern as PU but simpler.
+ */
+
+/* XU control selectors */
+#define XU_ISP_PROFILE_SELECT  0x01
+
+/* Must match UVC_ENTITY_ISP_XU in usb_descriptors.h */
+#define XU_ENTITY_ID  0x04
+
+typedef struct {
+    uint8_t cs;
+    uint8_t cur;
+    uint8_t min;
+    uint8_t max;
+    uint8_t res;
+    uint8_t def;
+} xu_control_t;
+
+static xu_control_t s_xu_controls[] = {
+    { XU_ISP_PROFILE_SELECT, 3, 0, 5, 1, 3 },  /* default=Daylight(3), max=Shade(5) */
+};
+#define XU_CONTROL_COUNT (sizeof(s_xu_controls) / sizeof(s_xu_controls[0]))
+
+static uint8_t s_xu_set_buf;  /* receive buffer for XU SET_CUR data stage */
+
+void uvc_xu_set_default(uint8_t cs, uint8_t value)
+{
+    for (int i = 0; i < XU_CONTROL_COUNT; i++) {
+        if (s_xu_controls[i].cs == cs) {
+            if (value >= s_xu_controls[i].min && value <= s_xu_controls[i].max) {
+                s_xu_controls[i].cur = value;
+                s_xu_controls[i].def = value;
+            }
+            return;
+        }
+    }
+}
+
+/* Weak callback: application overrides to handle XU control changes */
+TU_ATTR_WEAK void uvc_xu_control_set_cb(uint8_t cs, uint8_t value)
+{
+    (void)cs; (void)value;
+}
+
+/*
+ * Unified entity control handler for both PU (entity 0x02) and XU (entity 0x04).
+ */
+int tud_video_entity_control_xfer_cb(uint8_t rhport, uint8_t stage,
+                                      tusb_control_request_t const *request,
+                                      uint_fast8_t ctl_idx)
+{
+    (void)ctl_idx;
+    uint8_t entity_id = TU_U16_HIGH(request->wIndex);
+    uint8_t cs = TU_U16_HIGH(request->wValue);
+
+    if (entity_id == PU_ENTITY_ID) {
+        /* ---- Processing Unit controls (int16_t) ---- */
+        pu_control_t *ctrl = NULL;
+        for (unsigned i = 0; i < PU_CONTROL_COUNT; i++) {
+            if (s_pu_controls[i].cs == cs) {
+                ctrl = &s_pu_controls[i];
+                break;
+            }
+        }
+        if (!ctrl) {
+            return VIDEO_ERROR_INVALID_REQUEST;
+        }
+
+        if (stage == CONTROL_STAGE_SETUP) {
+            switch (request->bRequest) {
+            case VIDEO_REQUEST_GET_CUR:
+                return tud_control_xfer(rhport, request, &ctrl->cur, sizeof(int16_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_MIN:
+                return tud_control_xfer(rhport, request, &ctrl->min, sizeof(int16_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_MAX:
+                return tud_control_xfer(rhport, request, &ctrl->max, sizeof(int16_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_RES:
+                return tud_control_xfer(rhport, request, &ctrl->res, sizeof(int16_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_DEF:
+                return tud_control_xfer(rhport, request, &ctrl->def, sizeof(int16_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_INFO: {
+                static uint8_t const info = 0x03; /* supports GET and SET */
+                return tud_control_xfer(rhport, request, (uint8_t *)(uintptr_t)&info, sizeof(info))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            }
+            case VIDEO_REQUEST_SET_CUR:
+                return tud_control_xfer(rhport, request, &s_pu_set_buf, sizeof(s_pu_set_buf))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            default:
+                return VIDEO_ERROR_INVALID_REQUEST;
+            }
+        } else if (stage == CONTROL_STAGE_DATA) {
+            if (request->bRequest == VIDEO_REQUEST_SET_CUR) {
+                if (s_pu_set_buf < ctrl->min) s_pu_set_buf = ctrl->min;
+                if (s_pu_set_buf > ctrl->max) s_pu_set_buf = ctrl->max;
+                ctrl->cur = s_pu_set_buf;
+                ESP_LOGI(TAG, "PU SET_CUR cs=0x%02x val=%d", cs, ctrl->cur);
+                uvc_pu_control_set_cb(cs, ctrl->cur);
+            }
+        }
+        return VIDEO_ERROR_NONE;
+
+    } else if (entity_id == XU_ENTITY_ID) {
+        /* ---- Extension Unit controls (uint8_t) ---- */
+        xu_control_t *ctrl = NULL;
+        for (unsigned i = 0; i < XU_CONTROL_COUNT; i++) {
+            if (s_xu_controls[i].cs == cs) {
+                ctrl = &s_xu_controls[i];
+                break;
+            }
+        }
+        if (!ctrl) {
+            return VIDEO_ERROR_INVALID_REQUEST;
+        }
+
+        if (stage == CONTROL_STAGE_SETUP) {
+            switch (request->bRequest) {
+            case VIDEO_REQUEST_GET_CUR:
+                return tud_control_xfer(rhport, request, &ctrl->cur, sizeof(uint8_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_MIN:
+                return tud_control_xfer(rhport, request, &ctrl->min, sizeof(uint8_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_MAX:
+                return tud_control_xfer(rhport, request, &ctrl->max, sizeof(uint8_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_RES:
+                return tud_control_xfer(rhport, request, &ctrl->res, sizeof(uint8_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_DEF:
+                return tud_control_xfer(rhport, request, &ctrl->def, sizeof(uint8_t))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            case VIDEO_REQUEST_GET_INFO: {
+                static uint8_t const info = 0x03; /* supports GET and SET */
+                return tud_control_xfer(rhport, request, (uint8_t *)(uintptr_t)&info, sizeof(info))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            }
+            case VIDEO_REQUEST_SET_CUR:
+                return tud_control_xfer(rhport, request, &s_xu_set_buf, sizeof(s_xu_set_buf))
+                       ? VIDEO_ERROR_NONE : VIDEO_ERROR_UNKNOWN;
+            default:
+                return VIDEO_ERROR_INVALID_REQUEST;
+            }
+        } else if (stage == CONTROL_STAGE_DATA) {
+            if (request->bRequest == VIDEO_REQUEST_SET_CUR) {
+                if (s_xu_set_buf < ctrl->min) s_xu_set_buf = ctrl->min;
+                if (s_xu_set_buf > ctrl->max) s_xu_set_buf = ctrl->max;
+                ctrl->cur = s_xu_set_buf;
+                ESP_LOGI(TAG, "XU SET_CUR cs=0x%02x val=%u", cs, ctrl->cur);
+                uvc_xu_control_set_cb(cs, ctrl->cur);
+            }
+        }
+        return VIDEO_ERROR_NONE;
+    }
+
+    return VIDEO_ERROR_INVALID_REQUEST;
+}
+
+esp_err_t uvc_device_config(int index, uvc_device_config_t *config)
+{
+    ESP_RETURN_ON_FALSE(index < UVC_CAM_NUM, ESP_ERR_INVALID_ARG, TAG, "index is invalid");
+    ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG, "config is NULL");
+    ESP_RETURN_ON_FALSE(config->start_cb != NULL, ESP_ERR_INVALID_ARG, TAG, "start_cb is NULL");
+    ESP_RETURN_ON_FALSE(config->fb_get_cb != NULL, ESP_ERR_INVALID_ARG, TAG, "fb_get_cb is NULL");
+    ESP_RETURN_ON_FALSE(config->fb_return_cb != NULL, ESP_ERR_INVALID_ARG, TAG, "fb_return_cb is NULL");
+    ESP_RETURN_ON_FALSE(config->stop_cb != NULL, ESP_ERR_INVALID_ARG, TAG, "stop_cb is NULL");
+    ESP_RETURN_ON_FALSE(config->uvc_buffer != NULL, ESP_ERR_INVALID_ARG, TAG, "uvc_buffer is NULL");
+    ESP_RETURN_ON_FALSE(config->uvc_buffer_size > 0, ESP_ERR_INVALID_ARG, TAG, "uvc_buffer_size is 0");
+
+    s_uvc_device.user_config[index] = *config;
+    s_uvc_device.interval_ms[index] = 33; /* default 30fps, updated by commit_cb */
+    s_uvc_device.uvc_init[index] = true;
+    return ESP_OK;
+}
+
+esp_err_t uvc_device_init(void)
+{
+    ESP_RETURN_ON_FALSE(s_uvc_device.uvc_init[0], ESP_ERR_INVALID_STATE, TAG, "uvc device not configured");
+
+    s_uvc_device.event_group = xEventGroupCreate();
+    if (s_uvc_device.event_group == NULL) {
+        ESP_LOGE(TAG, "Failed to create event group");
+        return ESP_FAIL;
+    }
+
+    /* Initialize the USB OTG-HS UTMI PHY — enables the peripheral clock so
+     * TinyUSB can access DWC2 registers at 0x50000000.  The managed TinyUSB
+     * dwc2_phy_init() for ESP32-P4 is a no-op, so this must be done here. */
+    usb_phy_config_t phy_conf = {
+        .controller = USB_PHY_CTRL_OTG,
+        .target     = USB_PHY_TARGET_UTMI,
+        .otg_mode   = USB_OTG_MODE_DEVICE,
+        .otg_speed  = USB_PHY_SPEED_HIGH,
+    };
+    ESP_RETURN_ON_ERROR(usb_new_phy(&phy_conf, &s_uvc_device.phy_handle),
+                        TAG, "USB UTMI PHY init failed");
+
+    bool usb_init = tusb_init();
+    if (!usb_init) {
+        ESP_LOGE(TAG, "USB Device Stack Init Fail");
+        vEventGroupDelete(s_uvc_device.event_group);
+        s_uvc_device.event_group = NULL;
+        return ESP_FAIL;
+    }
+
+    BaseType_t core_id = (CONFIG_UVC_TINYUSB_TASK_CORE < 0) ? tskNO_AFFINITY : CONFIG_UVC_TINYUSB_TASK_CORE;
+    xTaskCreatePinnedToCore(tusb_device_task, "TinyUSB", 4096, NULL,
+                            CONFIG_UVC_TINYUSB_TASK_PRIORITY, &s_uvc_device.tusb_task_hdl, core_id);
+
+    core_id = (CONFIG_UVC_CAM1_TASK_CORE < 0) ? tskNO_AFFINITY : CONFIG_UVC_CAM1_TASK_CORE;
+    xTaskCreatePinnedToCore(video_task, "UVC", 4096, NULL,
+                            CONFIG_UVC_CAM1_TASK_PRIORITY, &s_uvc_device.uvc_task_hdl[0], core_id);
+
+    ESP_LOGI(TAG, "UVC Device Start (Multi-format: YUY2+MJPEG+H264)");
+    return ESP_OK;
+}
+
+esp_err_t uvc_device_deinit(void)
+{
+    ESP_RETURN_ON_FALSE(s_uvc_device.uvc_init[0], ESP_ERR_INVALID_STATE, TAG, "uvc device not init");
+    ESP_RETURN_ON_FALSE(s_uvc_device.event_group != NULL, ESP_ERR_INVALID_STATE, TAG, "event group is NULL");
+
+    xEventGroupSetBits(s_uvc_device.event_group, UVC1_EVENT_EXIT);
+    xEventGroupWaitBits(s_uvc_device.event_group, UVC1_EVENT_EXIT_DONE, pdTRUE, pdTRUE, portMAX_DELAY);
+
+    if (s_uvc_device.user_config[0].stop_cb) {
+        s_uvc_device.user_config[0].stop_cb(s_uvc_device.user_config[0].cb_ctx);
+    }
+
+    xEventGroupSetBits(s_uvc_device.event_group, TUSB_EVENT_EXIT);
+    EventBits_t bits = xEventGroupWaitBits(s_uvc_device.event_group, TUSB_EVENT_EXIT_DONE,
+                                           pdTRUE, pdTRUE, pdMS_TO_TICKS(5000));
+    if (!(bits & TUSB_EVENT_EXIT_DONE)) {
+        ESP_LOGW(TAG, "TinyUSB task exit timeout, force delete");
+        if (s_uvc_device.tusb_task_hdl) {
+            vTaskDelete(s_uvc_device.tusb_task_hdl);
+            s_uvc_device.tusb_task_hdl = NULL;
+        }
+    }
+
+    vEventGroupDelete(s_uvc_device.event_group);
+    s_uvc_device.event_group = NULL;
+
+    tusb_teardown();
+
+    if (s_uvc_device.phy_handle) {
+        usb_del_phy(s_uvc_device.phy_handle);
+        s_uvc_device.phy_handle = NULL;
+    }
+
+    memset(s_uvc_device.uvc_init, 0, sizeof(s_uvc_device.uvc_init));
+    ESP_LOGI(TAG, "UVC Device Deinit");
+    return ESP_OK;
+}

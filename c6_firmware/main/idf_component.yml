@@ -1,0 +1,8 @@
+dependencies:
+  idf:
+    version: ">=5.5"
+  # MUST be the exact same esp_hosted version as the P4 host app
+  # (../main/idf_component.yml). Host and coprocessor speak a versioned RPC
+  # wire; a mismatch shows up as a link that never completes handshake.
+  espressif/esp_hosted:
+    version: "==3.0.1"

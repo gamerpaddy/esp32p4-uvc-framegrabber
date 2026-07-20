@@ -1,0 +1,12 @@
+dependencies:
+  idf: ">=5.4"
+  usb_device_uvc:
+    version: "*"
+    override_path: "../components/usb_device_uvc"
+  # ESP32-P4 has no radio: Wi-Fi comes from the on-module ESP32-C6 over SDIO.
+  # esp_hosted is the transport; esp_wifi_remote forwards the esp_wifi_* API onto it.
+  espressif/esp_hosted: "^3.0.0"
+  espressif/esp_wifi_remote: "*"
+  # Flashes the C6 coprocessor over UART from the P4 (EN=GPIO54, BOOT=GPIO11,
+  # TX=GPIO13, RX=GPIO12) - the module has no USB path to the C6.
+  espressif/esp-serial-flasher: "^1.9.0"
