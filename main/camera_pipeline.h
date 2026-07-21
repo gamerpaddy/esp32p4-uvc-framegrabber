@@ -96,6 +96,11 @@ typedef struct {
     volatile uint32_t dbg_finished;
     volatile uint32_t dbg_no_free;
     volatile uint32_t dbg_recv_size;   /* received_size of the last completed frame */
+    /* Captures rejected by the phase classifier's dead band — a mix of both
+     * interleaved phases, i.e. the DMA was rearmed after the next frame had
+     * already started. A climbing count is the direct measure of the sideways
+     * shear; it should stay at (or very near) zero. */
+    volatile uint32_t dbg_torn;
 
     /* Freeze watchdog: a thermal-cam FFC (or any PCLK/VSYNC glitch) can wedge
      * the CAM so it keeps EOF-ing but only redelivers the few stale capture
@@ -119,7 +124,8 @@ typedef struct {
     volatile size_t   tap_bytes;
     volatile uint32_t tap_width;
     volatile uint32_t tap_height;
-    volatile bool     tap_pending;
+    volatile bool     tap_pending;   /* a reader is waiting for the next frame */
+    volatile bool     tap_busy;      /* a consumer is copying INTO tap_buf now */
     SemaphoreHandle_t tap_sem;
 } camera_ctx_t;
 
@@ -155,15 +161,20 @@ void camera_release_frame(camera_ctx_t *ctx, void *buf);
  * viewer gets zero frames, not half. The tap instead copies the frame that the
  * primary consumer is already taking, so nothing is stolen.
  *
- * camera_tap_init() allocates the copy buffer (PSRAM). camera_tap_get() asks
- * for the next frame and blocks; it returns false on timeout, which is what
- * happens when NOTHING is consuming frames (e.g. no USB host attached) — in
- * that case the caller should fall back to camera_get_frame(), which is
+ * camera_tap_init() allocates the copy buffer (PSRAM). camera_tap_borrow()
+ * asks for the next frame and blocks; it returns NULL on timeout, which is
+ * what happens when NOTHING is consuming frames (e.g. no USB host attached) —
+ * in that case the caller should fall back to camera_get_frame(), which is
  * uncontended precisely because there is no other consumer.
+ *
+ * BORROW semantics: the returned pointer is into the tap buffer and stays
+ * valid until this caller's NEXT camera_tap_borrow(). There is exactly one
+ * tap reader, so no refcount is needed — but do not stash the pointer across
+ * calls, and do not call this from two tasks.
  */
 esp_err_t camera_tap_init(camera_ctx_t *ctx, size_t max_bytes);
-bool camera_tap_get(camera_ctx_t *ctx, uint16_t *dst, size_t dst_bytes,
-                    uint32_t *out_w, uint32_t *out_h, uint32_t timeout_ms);
+const uint16_t *camera_tap_borrow(camera_ctx_t *ctx, uint32_t *out_w,
+                                   uint32_t *out_h, uint32_t timeout_ms);
 
 /* ---- Framing routing (fixed; applied once by camera_open) --------------- */
 /*

@@ -42,12 +42,31 @@
  *     anything larger).
  *   - THERMAL_MAX_PIXELS additionally bounds the product so unusual aspect
  *     ratios don't blow past the intended memory footprint.
- * ~500k pixels covers 640x480 with comfortable headroom; bump the per-dim
- * caps if a wider or taller sensor shows up.
+ * These are exactly the largest advertised frame (640x480) with NO headroom,
+ * and that is deliberate — see the cost note below. Bump them (and only them)
+ * if a larger sensor is ever advertised.
+ *
+ * WHY HEADROOM IS EXPENSIVE HERE, not free:
+ *   THERMAL_MAX_* sets the DVP h_res/v_res, which fixes the driver's
+ *   fb_size_in_bytes. On EVERY VSYNC EOF the IDF 6.0.1 DVP ISR
+ *   (esp_cam_ctlr_recv_frame_done_isr) cache-invalidates that many bytes
+ *   TWICE — once in esp_cam_ctlr_dvp_get_recved_size() for the buffer that
+ *   just completed, once in esp_cam_ctlr_dvp_start_trans() for the buffer it
+ *   is about to hand the DMA — and esp_cache_msync() does an M2C invalidate
+ *   inside a spinlock critical section, unchunked, with interrupts disabled.
+ *   The cost is proportional to the BUFFER size, not to the bytes actually
+ *   received, so unused headroom is paid for at 50 Hz forever.
+ *
+ *   The old 800x640 caps meant 800*(640+64)*2 = 1,126,400 B invalidated twice
+ *   per EOF = ~113 MB/s of interrupt-disabled cache maintenance, to deliver a
+ *   221,184 B frame. 640x480 cuts that 1.6x at zero functional cost (nothing
+ *   larger is advertised). Pinning the capture to the 384x288 sensor instead
+ *   of the max would cut it 4.2x, but costs the ability to commit the 640x480
+ *   frame at runtime — see camera_set_resolution().
  */
-#define THERMAL_MAX_WIDTH   800
-#define THERMAL_MAX_HEIGHT  640
-#define THERMAL_MAX_PIXELS  500000
+#define THERMAL_MAX_WIDTH   640
+#define THERMAL_MAX_HEIGHT  480
+#define THERMAL_MAX_PIXELS  (640 * 480)
 
 /* Bytes per pixel for the Y16 format (2 bytes = 16-bit). */
 #define THERMAL_BPP     2

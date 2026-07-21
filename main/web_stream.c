@@ -35,6 +35,7 @@
 #include "web_stream.h"
 #include "camera_uart.h"
 #include "uvc_frame_config.h"
+#include "uvc_streaming.h"   /* uvc_stream_is_active() — picks tap vs direct */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -68,19 +69,17 @@ static const char *TAG = "web_stream";
 #define WEB_FRAME_TIMEOUT_MS 500
 
 /*
- * Tap probe timeout — how long capture_jpeg() waits on the observer tap before
- * concluding that nothing else is consuming frames and going to the direct
- * capture path. Must be a comfortable multiple of the ~40 ms phase period so a
- * live UVC session's tap signal never times out spuriously; must also be short
- * enough that with NO consumer, the ~5 consecutive misses it takes to switch
- * to direct mode don't wreck the delivered fps. 120 ms hits both.
+ * How long capture_jpeg() waits on the observer tap once it has established
+ * (via uvc_stream_is_active()) that a UVC host really is consuming frames.
+ * A comfortable multiple of the ~40 ms phase period so a live session's tap
+ * signal never times out spuriously. Reaching this timeout now means UVC went
+ * idle during the wait — we lose that one frame and take the direct path next
+ * time round.
  *
- * WEB_FRAME_TIMEOUT_MS above (500 ms) is still used by the direct-capture
- * fallback and by the stream_task's "no frames" break condition.
+ * WEB_FRAME_TIMEOUT_MS above (500 ms) is used by the direct-capture path and
+ * by the stream_task's "no frames" break condition.
  */
 #define WEB_TAP_PROBE_MS  120
-#define WEB_TAP_SKIP_AFTER 5   /* after N consecutive misses, skip the tap entirely */
-#define WEB_TAP_RETRY_EVERY 25 /* one probe per ~1 s to detect UVC coming online */
 
 /* Multipart/x-mixed-replace: the format every browser renders natively as a
  * live <img>, with no JavaScript and no MSE. */
@@ -93,7 +92,6 @@ static const char *STREAM_PART_HDR =
 typedef struct {
     camera_ctx_t        *cam;
     jpeg_encoder_handle_t enc;
-    uint16_t            *y16;        /* tap copy of the raw frame */
     uint8_t             *gray;       /* AGC output, 8bpp, JPEG encoder input */
     uint8_t             *jpg;        /* encoded bitstream */
     size_t               jpg_cap;
@@ -106,17 +104,35 @@ static web_ctx_t s_web;
 /*
  * Window the 14-bit thermal frame into 8-bit grey.
  *
- * Percentile-clipped linear stretch, matching robust_range() in cam_viewer.py
- * (CLIP_PCT there, WEB_CLIP_PERMILLE here). A plain min/max stretch does not
- * work on this sensor: a single dead pixel near 0 and one hot pixel near full
- * scale drag the endpoints to the edges of the 14-bit space, so the actual
- * scene - which occupies a few hundred counts around a ~7000 baseline -
- * compresses into a narrow mid-grey band. That renders exactly as "bright and
- * low contrast, as if it were not normalised at all".
+ * Percentile-clipped linear stretch. This is the firmware equivalent of
+ * robust_range() in cam_viewer.py, which is:
  *
- * Trimming each tail is done from a 1024-bin histogram rather than a sort:
- * two linear passes, no allocation, and 16-count resolution is far finer than
- * the window this ever picks.
+ *     lo = np.percentile(frame14, CLIP_PCT)          # 0.5
+ *     hi = np.percentile(frame14, 100 - CLIP_PCT)    # 99.5
+ *
+ * CLIP_PCT (0.5%) and WEB_CLIP_PERMILLE (5/1000) are the same number, and the
+ * bin interpolation below reproduces np.percentile's linear interpolation, so
+ * the two agree to within a count or so on the same frame.
+ *
+ * A plain min/max stretch does not work on this sensor: a single dead pixel
+ * near 0 and one hot pixel near full scale drag the endpoints to the edges of
+ * the 14-bit space, so the actual scene - which occupies a few hundred counts
+ * around a ~7000 baseline - compresses into a narrow mid-grey band. That
+ * renders exactly as "bright and low contrast, as if it were not normalised at
+ * all".
+ *
+ * Trimming each tail is done from a 1024-bin histogram rather than a sort: two
+ * linear passes and no allocation, where NumPy can afford to partition the
+ * whole array.
+ *
+ * TWO DELIBERATE DIFFERENCES from the viewer, both for reasons the viewer does
+ * not have on a PC:
+ *   - the histogram subsamples (WEB_AGC_SAMPLE_STRIDE); a percentile does not
+ *     need every pixel, and this is the expensive pass. Unbiased, marginally
+ *     noisier.
+ *   - the window is IIR-smoothed across frames (see below). The viewer
+ *     recomputes per frame and is happy to flicker; on the MJPEG stream that
+ *     flicker was a reported symptom.
  *
  * Per-frame adaptive, so a hot object entering the scene rescales everything -
  * fine for "is it working", wrong for radiometry. Anyone who needs real
@@ -126,30 +142,126 @@ static web_ctx_t s_web;
 #define WEB_AGC_SHIFT     4          /* 14-bit value >> 4 == 1024 bins */
 #define WEB_CLIP_PERMILLE 5          /* trim 0.5% off each tail, as the host does */
 
+/* Smoothed AGC window, carried across frames (see the IIR note below). Touched
+ * only from the single mjpeg task, so no locking. */
+static uint16_t s_agc_lo, s_agc_hi;
+static bool     s_agc_valid;
+
+/*
+ * Histogram subsample stride. The histogram exists only to locate two
+ * percentiles, and a percentile does not need every pixel — at 384x288 every
+ * 4th pixel is still 27 k samples across 1024 bins. The bins are 16 counts
+ * wide, so the sampling error is far below one bin and the chosen [lo,hi] is
+ * identical in practice, at a quarter of the cost. This is the expensive pass
+ * (a strided read of the whole frame out of PSRAM); the mapping pass below
+ * must stay at full rate because it writes every output pixel.
+ *
+ * Must not share a common factor with the image width, or the samples land in
+ * a few fixed columns instead of spreading over the frame. 3 is coprime with
+ * both 384 and 640.
+ */
+#define WEB_AGC_SAMPLE_STRIDE 3
+
 static void agc_y16_to_gray(const uint16_t *src, uint8_t *dst, size_t pixels)
 {
     uint32_t histo[WEB_AGC_BINS] = { 0 };
-    for (size_t i = 0; i < pixels; i++) {
+    uint32_t sampled = 0;
+    for (size_t i = 0; i < pixels; i += WEB_AGC_SAMPLE_STRIDE) {
         histo[(src[i] & 0x3FFF) >> WEB_AGC_SHIFT]++;
+        sampled++;
     }
 
-    /* Walk in from both ends until the clipped quota of pixels is consumed. */
-    uint32_t quota = (uint32_t)((pixels * WEB_CLIP_PERMILLE) / 1000u);
+    /* Walk in from both ends until the clipped quota of samples is consumed.
+     * Quota is a fraction of the SAMPLED count, not of `pixels` — using the
+     * full pixel count here would over-trim by the stride factor. */
+    uint32_t quota = (sampled * WEB_CLIP_PERMILLE) / 1000u;
     uint32_t acc = 0;
     int lo_bin = 0, hi_bin = WEB_AGC_BINS - 1;
     for (; lo_bin < hi_bin; lo_bin++) {
         acc += histo[lo_bin];
         if (acc > quota) break;
     }
+    uint32_t lo_below = acc - histo[lo_bin];    /* samples strictly below this bin */
+
     acc = 0;
     for (; hi_bin > lo_bin; hi_bin--) {
         acc += histo[hi_bin];
         if (acc > quota) break;
     }
+    uint32_t hi_above = acc - histo[hi_bin];    /* samples strictly above this bin */
 
-    uint16_t lo = (uint16_t)(lo_bin << WEB_AGC_SHIFT);
-    uint16_t hi = (uint16_t)((hi_bin << WEB_AGC_SHIFT) | ((1 << WEB_AGC_SHIFT) - 1));
+    /*
+     * Interpolate WITHIN the boundary bin, so lo/hi come out as real sensor
+     * counts rather than bin edges.
+     *
+     * This is what makes the result match robust_range() in cam_viewer.py,
+     * which is np.percentile(frame14, 0.5 / 99.5) — and np.percentile
+     * interpolates linearly between order statistics. Taking the raw bin edges
+     * instead (lo = bin<<4, hi = bin<<4 | 15) quantised the window to 16
+     * counts and always rounded OUTWARD, so the firmware window came out up to
+     * 32 counts wider than the viewer's. On this sensor the scene occupies a
+     * few hundred counts around the ~7000 baseline, so that was a >10%
+     * contrast loss against the viewer on the same frame.
+     *
+     * The cost is two divides PER FRAME — everything here is arithmetic on
+     * counters the histogram walk already produced. The per-pixel work is
+     * untouched, so this is free in the sense that matters.
+     *
+     * Both fractions are guaranteed < 1: each loop broke on
+     * acc > quota, i.e. quota - (acc - histo[bin]) < histo[bin], so the
+     * interpolated value cannot escape its own bin.
+     */
+#define WEB_AGC_BIN_SPAN (1u << WEB_AGC_SHIFT)
+    uint32_t lo_val = (uint32_t)lo_bin << WEB_AGC_SHIFT;
+    if (histo[lo_bin]) {
+        lo_val += ((quota - lo_below) * WEB_AGC_BIN_SPAN) / histo[lo_bin];
+    }
+    /* hi walks DOWNWARD from the top of its bin, mirroring the descending loop. */
+    uint32_t hi_val = ((uint32_t)hi_bin << WEB_AGC_SHIFT) + WEB_AGC_BIN_SPAN - 1u;
+    if (histo[hi_bin]) {
+        hi_val -= ((quota - hi_above) * WEB_AGC_BIN_SPAN) / histo[hi_bin];
+    }
+
+    uint16_t lo = (uint16_t)lo_val;
+    uint16_t hi = (uint16_t)hi_val;
     if (hi <= lo) {                         /* flat frame - avoid a divide by zero */
+        memset(dst, 0, pixels);
+        s_agc_valid = false;                /* don't smooth across a dropout */
+        return;
+    }
+
+    /*
+     * Temporal smoothing of the window.
+     *
+     * The window is re-derived from scratch every frame, so anything that
+     * perturbs one frame's histogram moves the whole tone curve for exactly
+     * that frame and then snaps back — which is what "the AGC changes contrast
+     * for 1..2 frames" looks like. Sensor noise alone wobbles the endpoints by
+     * a bin or two; a real transient (an FFC, a hand entering the scene, a
+     * capture the phase classifier let through) throws them much further.
+     *
+     * A one-pole IIR over lo and hi keeps the steady-state window exactly
+     * where the percentiles put it, but spreads any step over several frames
+     * so a single odd frame can no longer flash the whole image. At 1/4 weight
+     * a genuine scene change still settles in ~5 frames (~200 ms at 25 fps),
+     * which reads as responsive.
+     *
+     * The window is reset rather than smoothed when it moves further than
+     * AGC_JUMP counts — that is a resolution switch or a phase change, not
+     * drift, and easing into it would show a few badly-scaled frames.
+     */
+#define AGC_JUMP 2048
+    if (s_agc_valid &&
+        (uint32_t)abs((int)lo - (int)s_agc_lo) < AGC_JUMP &&
+        (uint32_t)abs((int)hi - (int)s_agc_hi) < AGC_JUMP) {
+        lo = (uint16_t)((s_agc_lo * 3u + lo) / 4u);
+        hi = (uint16_t)((s_agc_hi * 3u + hi) / 4u);
+    }
+    s_agc_lo    = lo;
+    s_agc_hi    = hi;
+    s_agc_valid = true;
+
+    if (hi <= lo) {                         /* smoothing collapsed the window */
         memset(dst, 0, pixels);
         return;
     }
@@ -177,71 +289,71 @@ static uint32_t capture_jpeg(void)
 {
     camera_ctx_t *cam = s_web.cam;
     uint32_t w = 0, h = 0;
-    bool got = false;
+    const uint16_t *src = NULL;
+    void *hold = NULL;          /* non-NULL = we hold a DVP buffer to release */
 
     /*
-     * Adaptive path selection:
+     * Path selection is a straight ASK, not a probe.
      *
-     *   With UVC active — a primary consumer signals the tap ~25 times/s, so
-     *   camera_tap_get() returns almost immediately. Any direct claim here
-     *   would lose the buffer race against the UVC task (prio 23 vs our 5)
-     *   and deliver zero frames — see the tap rationale in camera_pipeline.c.
+     *   UVC active   — a primary consumer signals the tap ~25 times/s, so
+     *     camera_tap_borrow() returns almost immediately. A direct claim here
+     *     would lose the buffer race against the UVC task (prio 23 vs our 5)
+     *     and deliver zero frames — see the tap rationale in camera_pipeline.c.
+     *   UVC idle     — nothing ever signals the tap, so claim directly. That
+     *     is uncontended by definition in this case.
      *
-     *   With NO UVC — nothing ever signals the tap, so a plain 500 ms wait
-     *   here caps output at ~2 fps. Instead: probe the tap briefly, and after
-     *   a few consecutive misses assume nothing's consuming and switch to a
-     *   direct claim (which is uncontended in that case, by definition).
+     * This used to guess, by probing the tap for WEB_TAP_PROBE_MS and counting
+     * misses, and that guessing was itself a major source of the uneven frame
+     * rate: with no UVC host, every WEB_TAP_RETRY_EVERY (25) frames it spent a
+     * full 120 ms blocked on a tap that nothing was ever going to fill, just to
+     * re-check whether UVC had come online. One dead 120 ms window per ~25
+     * frames is a visible hitch about once a second, plus 5 x 120 ms of dead
+     * probing at the start of every stream.
      *
-     * Every WEB_TAP_RETRY_EVERY frames we probe once more so a UVC session
-     * that starts mid-stream is picked up within ~1 s.
+     * uvc_stream_is_active() answers the same question for free — it is
+     * exactly "a host has accepted a frame in the last 500 ms", i.e. "someone
+     * is calling camera_get_frame() at priority 23 right now". If it flips
+     * between the check and the call we lose one frame and correct on the
+     * next, which is the same cost the probe paid every single time.
      */
-    static uint32_t s_tap_misses;
-    static uint32_t s_frame_seq;
-    s_frame_seq++;
-
-    bool try_tap = (s_tap_misses < WEB_TAP_SKIP_AFTER) ||
-                   ((s_frame_seq % WEB_TAP_RETRY_EVERY) == 0);
-
-    if (try_tap) {
-        if (camera_tap_get(cam, s_web.y16, (size_t)WEB_MAX_PIXELS * 2, &w, &h,
-                           WEB_TAP_PROBE_MS)) {
-            got = true;
-            s_tap_misses = 0;
-        } else if (s_tap_misses < 0xFF) {
-            s_tap_misses++;
-        }
-    }
-
-    if (!got) {
-        /* Direct capture path — the uncontended case (no other consumer, or
-         * we're mid-probe-window). If UVC IS running and we happen to hit this
-         * branch on a retry, the priority difference makes camera_get_frame
-         * usually time out cleanly and we return 0 for this iteration; the
-         * next tap_get succeeds and we're back on the shared path. */
-        void *hold = NULL;
-        const uint16_t *raw = camera_get_frame(cam, &hold, WEB_FRAME_TIMEOUT_MS);
-        if (!raw) {
-            return 0;                        /* DVP really has no data */
-        }
+    if (uvc_stream_is_active()) {
+        src = camera_tap_borrow(cam, &w, &h, WEB_TAP_PROBE_MS);
+    } else {
+        src = camera_get_frame(cam, &hold, WEB_FRAME_TIMEOUT_MS);
         w = cam->width;
         h = cam->height;
-        size_t bytes = (size_t)w * h * 2;
-        if (bytes > (size_t)WEB_MAX_PIXELS * 2) {
-            camera_release_frame(cam, hold);
-            ESP_LOGE(TAG, "frame %"PRIu32"x%"PRIu32" exceeds the buffer", w, h);
-            return 0;
-        }
-        memcpy(s_web.y16, raw, bytes);
-        camera_release_frame(cam, hold);     /* hand it back immediately */
+    }
+    if (!src) {
+        return 0;
     }
 
     size_t pixels = (size_t)w * h;
     if (!pixels || pixels > WEB_MAX_PIXELS) {
+        if (hold) camera_release_frame(cam, hold);
         ESP_LOGE(TAG, "bad frame geometry %"PRIu32"x%"PRIu32, w, h);
         return 0;
     }
 
-    agc_y16_to_gray(s_web.y16, s_web.gray, pixels);
+    /*
+     * AGC reads `src` in place — no staging copy in either path.
+     *
+     * Direct path: we AGC straight out of the DVP buffer and release it
+     * immediately after, rather than memcpy'ing it to a private buffer first.
+     * Holding it for the duration of one AGC pass is safe for the pool: the
+     * worst case is 1 WRITING + 2 READY + 1 UVC READING + 1 us = 5 of 6, which
+     * still leaves the FREE buffer that on_get_new_trans needs.
+     *
+     * Tap path: camera_tap_borrow() hands back a pointer into the tap buffer
+     * instead of copying it out.
+     *
+     * Between them that removes one full-frame PSRAM->PSRAM copy per web
+     * frame (614 KB at 640x480) and the whole s_web.y16 staging buffer.
+     */
+    agc_y16_to_gray(src, s_web.gray, pixels);
+
+    if (hold) {
+        camera_release_frame(cam, hold);     /* AGC was the last read of src */
+    }
 
     jpeg_encode_cfg_t cfg = {
         .width         = w,
@@ -852,6 +964,8 @@ static void stream_task(void *arg)
 
     ESP_LOGI(TAG, "stream client connected");
 
+    s_agc_valid = false;   /* start this client's AGC from its own first frame */
+
     uint32_t frames = 0, empties = 0;
     int64_t  t0 = esp_timer_get_time();
     int64_t  fps_mark = t0;
@@ -958,10 +1072,9 @@ esp_err_t web_stream_start(camera_ctx_t *cam)
     };
     ESP_RETURN_ON_ERROR(jpeg_new_encoder_engine(&eng, &s_web.enc), TAG, "jpeg engine");
 
-    /* Copy buffer for the observer tap, plus the pipeline's own tap storage. */
+    /* The pipeline's tap storage. We AGC straight out of it (camera_tap_borrow
+     * lends a pointer), so there is no second staging buffer on this side. */
     ESP_RETURN_ON_ERROR(camera_tap_init(cam, (size_t)WEB_MAX_PIXELS * 2), TAG, "tap init");
-    s_web.y16 = heap_caps_malloc((size_t)WEB_MAX_PIXELS * 2, MALLOC_CAP_SPIRAM);
-    ESP_RETURN_ON_FALSE(s_web.y16, ESP_ERR_NO_MEM, TAG, "y16 buffer alloc");
 
     size_t got = 0;
     jpeg_encode_memory_alloc_cfg_t in_cfg  = { .buffer_direction = JPEG_ENC_ALLOC_INPUT_BUFFER };

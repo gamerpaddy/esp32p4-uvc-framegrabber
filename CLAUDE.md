@@ -24,7 +24,19 @@ it drives PCLK/HSYNC/VSYNC and has no I2C. Control is via UART only.
 | Data width | 14-bit | D[13:0]; D14/D15 tied to GND so each captured `uint16_t` is already Y16 |
 | PCLK | ~15 MHz | Camera drives it; the P4 is a slave (`external_xtal=1` suppresses XCLK) |
 | VSYNC | ~50 Hz | One capture per VSYNC |
-| Resolution | 384x288 | |
+| Resolution | 384x288 or 640x480 | Two physical camera modules; both work, see below |
+
+**There are two camera modules and BOTH are supported at runtime.** The
+firmware advertises both frame sizes over UVC, and `RES,W,H` switches between
+them live (persisted to NVS). Swap the module, pick the matching size in the
+viewer or the web UI, and it works — no reflash. What you must not do is
+select a size that does not match the module physically attached: the DVP just
+captures whatever the camera clocks out, so a 640x480 selection against a
+384-wide module frames garbage until you set it back.
+
+`CONFIG_THERMAL_WIDTH/HEIGHT` (384x288) is only the **boot default** — the size
+used before a host commits or a saved preference is restored. It is not a
+build-time lock on the camera model.
 
 **The source is interleaved.** It alternates two frame phases every VSYNC:
 
@@ -118,17 +130,50 @@ States (`BUF_FREE/WRITING/READY/READING`) transition only under `ctx->lock`.
 
 ### Phase selection is by CONTENT, not capture parity
 `parity_filter=true`, `keep_parity=1` are hardwired in `camera_open()`. The
-classifier counts pixels >0xFF over a subsample and takes a **majority** vote.
-An "any pixel >0xFF" test was not enough: a hot glowing object puts a few
->0xFF pixels into the *video* frame, which let the video phase through and
-made the view flip whenever something got hot.
+classifier counts pixels >0xFF over a subsample and votes with a **dead band**:
+>75% high = thermal, <25% high = 8-bit video, anything between is a **torn**
+capture and is dropped.
 
-### Capture buffer is taller than the image
+Two earlier versions were not enough:
+- "any pixel >0xFF" — a hot glowing object puts a few >0xFF pixels into the
+  *video* frame, so the video phase leaked through and the view flipped
+  whenever something got hot.
+- a bare majority (`hot*2 > total`) — classifies *everything*, including a
+  capture that straddles two frames. Those sit near 50/50, so the vote became a
+  coin flip and a half-video/half-thermal frame reached the consumer. That is
+  visible as a sideways seam, and it wrecks the web AGC for one or two frames
+  (bimodal histogram → `lo` collapses → washed out).
+
+`ctx->dbg_torn` counts dead-band rejections and prints in the frame-timeout
+log. **It is the direct measurement of the shear** and should sit at or near
+zero; a climbing count means the DMA is being rearmed late.
+
+### Capture geometry — and why it costs CPU
 `DVP_VBLANK_CAPTURE_MARGIN = 64` extra lines. If the DMA buffer is exactly
 `w*h*2`, the descriptor chain ends at the last active line *before* the VSYNC
 EOF fires, so EOF lands with no active descriptor. That race caused intermittent
 freezes and diagonal frame-start shear. Oversizing means VSYNC is the only frame
 delimiter. Only the first `w*h*2` bytes are ever delivered.
+
+The DVP `h_res`/`v_res` are fixed at `esp_cam_new_dvp_ctlr()` and cannot change
+without destroying and rebuilding the controller, so they are sized to the
+LARGEST advertised frame (`THERMAL_MAX_WIDTH x THERMAL_MAX_HEIGHT` + margin =
+640 x 544). That is what lets `camera_set_resolution()` be a cheap field update.
+
+**Do not add headroom to `THERMAL_MAX_*`.** They set the driver's
+`fb_size_in_bytes`, and the IDF 6.0.1 DVP EOF ISR
+(`esp_cam_ctlr_recv_frame_done_isr`) cache-invalidates that many bytes **twice
+per frame** — once for the buffer that just completed
+(`esp_cam_ctlr_dvp_get_recved_size`) and once for the buffer it is about to
+hand the DMA (`esp_cam_ctlr_dvp_start_trans`). `esp_cache_msync(...M2C)` does
+that inside a spinlock, **unchunked, with interrupts disabled**. Cost scales
+with the BUFFER size, not the received size, so unused headroom is paid for at
+50 Hz forever — and it lands in the exact window where the DMA has to be
+rearmed before the next frame's active video starts.
+
+These caps were once 800x640 "for headroom": 1,126,400 B invalidated twice per
+EOF, ~113 MB/s of interrupt-disabled cache maintenance, to deliver a 221 KB
+frame. Trimming them to the real 640x480 maximum cut that 1.6x for free.
 
 ### Two watchdogs
 - **Freeze watchdog**: a camera FFC or PCLK/VSYNC glitch can wedge the CAM so it
@@ -144,10 +189,34 @@ buffer before the prio-5 HTTP task is scheduled. The web stream measured
 **exactly zero frames**, not a fair share.
 
 The tap instead **copies** the frame the primary consumer is already taking:
-`camera_tap_get()` sets a pending flag and blocks; `camera_get_frame()` does the
-memcpy on whoever is consuming. If nothing is consuming (no USB host attached)
-the tap never fills and returns false, and the caller falls back to
+`camera_tap_borrow()` sets a pending flag and blocks; `camera_get_frame()` does
+the memcpy on whoever is consuming. If nothing is consuming (no USB host
+attached) the tap never fills and returns NULL, and the caller falls back to
 `camera_get_frame()`, which is uncontended by definition in that case.
+
+**Borrow, not copy-out.** `camera_tap_borrow()` returns a pointer *into* the
+tap buffer, valid until that same caller's next borrow. There is exactly one
+tap reader (the mjpeg task) so no refcount is needed. It used to memcpy into a
+caller-owned buffer, which put the frame across PSRAM twice on the way to the
+encoder — once into `tap_buf`, once out again.
+
+The handoff is claimed under `ctx->lock` with a `tap_busy` interlock. Testing
+`tap_pending` and clearing it *after* the memcpy raced with the reader's
+timeout path: the reader could time out mid-copy, clear the flag, come back,
+re-arm, and catch the give from the copy still in flight — reading `tap_buf`
+while the consumer was writing it.
+
+### Which path the web stream takes
+`capture_jpeg()` picks tap vs direct by **asking** `uvc_stream_is_active()`,
+which is exactly "a host accepted a frame in the last 500 ms", i.e. "someone is
+calling `camera_get_frame()` at prio 23 right now".
+
+It used to **guess**, by blocking on the tap for 120 ms and counting misses,
+and that guessing was a major source of uneven frame rate: with no UVC host it
+spent a full 120 ms blocked on a tap nothing would ever fill, once every 25
+frames, purely to re-check whether UVC had appeared. One dead 120 ms window per
+~25 frames is a visible hitch about once a second, plus 5 x 120 ms of dead
+probing at the start of every stream.
 
 ---
 
@@ -161,6 +230,7 @@ the tap never fills and returns false, and the caller falls back to
 | `uvc_streaming.c/.h` | UVC callbacks; no processing; NO SIGNAL checkerboard when DVP is dry |
 | `camera_uart.c/.h` | UART1 channel to the camera; framed protocol (STX/len/payload/checksum/ETX) |
 | `web_stream.c/.h` | HTTP server: `/`, `/stream` (MJPEG), `/snapshot`, `/stats` |
+| `settings.c/.h` | NVS-backed preferences — currently the resolution, so a `RES,W,H` pick survives reboot |
 | `wifi_console.c/.h` | Wi-Fi bring-up over ESP-Hosted + console: `scan`/`join`/`leave`/`status` |
 | `net_bench.c` | `sdiospeed` and `wifispeed` throughput benchmarks |
 | `c6_debug.c` | `c6mon` (listen to C6 UART0), `c6boot` (reset, `-d` = download mode) |
@@ -192,17 +262,28 @@ the tap never fills and returns false, and the caller falls back to
 
 - GUID `59 31 36 20 00 00 10 00 80 00 00 AA 00 38 9B 71` ("Y16 ")
 - 16 bpp little-endian; bits [13:0] = thermal count, [15:14] always 0
-- Frame 1: `CONFIG_THERMAL_WIDTH x CONFIG_THERMAL_HEIGHT` (currently 384x288)
-- Frame 2: 384x288 (`THERMAL_WIDTH2/HEIGHT2`, hardcoded)
+- Frame 1: `CONFIG_THERMAL_WIDTH x CONFIG_THERMAL_HEIGHT` — the boot default, 384x288
+- Frame 2: 640x480 (`THERMAL_WIDTH2/HEIGHT2`, hardcoded)
 - Bulk endpoint IN 0x81, single alt-setting
 
 `on_stream_start()` takes whatever the host committed and calls
-`camera_set_resolution()`.
+`camera_set_resolution()`, which changes only the DELIVERED frame size — the
+DVP controller and its DMA buffers are not rebuilt (see "Capture geometry").
 
-Both 384x288 and 640x480 camera models are supported, selected by
-`CONFIG_THERMAL_WIDTH/HEIGHT` in sdkconfig. What does NOT work is picking the
-other frame size at runtime: a host committing 640x480 against a 384-wide
-camera produces garbage, which is why `cam_viewer.py` offers only one entry.
+**Runtime switching between the two frame sizes works.** Both camera modules
+are supported live; `cam_viewer.py` lists both, as does the web UI. The
+resolution the user picks is persisted to NVS (`settings.c`) and restored at
+boot, before the host negotiates.
+
+Three ways to change it, all landing in `camera_set_resolution()`:
+- the USB host committing a frame (`on_stream_start`)
+- `RES,W,H` over the camera UART channel from the viewer, web UI, or console
+- the restored NVS preference at boot
+
+`RES` with no value is a QUERY and returns the **persisted preference**, not
+the current size — the viewer opens UVC at its own combo default before its
+serial query fires, so echoing the current size would just tell it what it
+already committed.
 
 ---
 
@@ -288,9 +369,51 @@ scene (a few hundred counts around a ~7000 baseline) compresses into a narrow
 mid-grey band. It renders as "bright and low contrast, as if not normalised at
 all" while normalisation is in fact running.
 
-Now clips 0.5% off each tail via a 1024-bin histogram, matching `robust_range()`
-in `cam_viewer.py`. Clamping in the mapping loop is mandatory: clipped tails mean
-pixels outside `[lo,hi]` exist, and unsigned `(v - lo)` would wrap and speckle.
+Now clips 0.5% off each tail via a 1024-bin histogram. Clamping in the mapping
+loop is mandatory: clipped tails mean pixels outside `[lo,hi]` exist, and
+unsigned `(v - lo)` would wrap and speckle.
+
+### The web AGC is the same window as the viewer's
+The target is `robust_range()` in `cam_viewer.py`, i.e.
+`np.percentile(frame14, 0.5)` / `np.percentile(frame14, 99.5)`. `CLIP_PCT`
+(0.5%) and `WEB_CLIP_PERMILLE` (5/1000) are the same number.
+
+The part that was *not* the same was resolution. Taking the raw histogram bin
+edges quantised the window to 16 counts and always rounded **outward**, so the
+firmware window came out up to 32 counts wider than the viewer's on the same
+frame. On this sensor the scene is a few hundred counts wide, so that was a
+double-digit contrast loss.
+
+Fixed by **interpolating within the boundary bin**, which is what
+`np.percentile` does between order statistics. Cost is two divides per frame —
+the per-pixel work is untouched. Measured against a reference percentile:
+
+| scene | window error, bin edges | interpolated |
+|-------|------------------------|--------------|
+| thermal ~7000 baseline, sd 120 | 1.5% | 0.5% |
+| narrow window (sd 25) | 10.9% | 4.7% |
+| bimodal (hot object in scene) | 0.4% | 0.1% |
+| 8-bit video phase | 15.6% | 2.8% |
+
+Residual error is 2-6 counts and is now dominated by the subsampling, not the
+binning. The narrow-window case keeps ~4.7% because a 129-count window is
+simply coarse against 16-count bins; interpolation cannot fully recover that.
+
+Two deliberate differences from the viewer remain, both for reasons a PC
+doesn't have:
+
+- **The histogram pass subsamples** (`WEB_AGC_SAMPLE_STRIDE = 3`). It only
+  locates two percentiles, and this is the expensive pass. Unbiased; costs
+  ~2-3 counts of extra noise on the endpoints. The stride must stay coprime
+  with the image width or the samples land in a few fixed columns. Note the
+  clip quota is a fraction of the SAMPLED count, not of `pixels`.
+- **The window is smoothed across frames** (one-pole IIR, 1/4 weight). The
+  window is otherwise re-derived from scratch every frame, so anything that
+  perturbs one histogram moves the whole tone curve for exactly that frame and
+  snaps back — which is what "the contrast changes for 1..2 frames" looks like.
+  The viewer recomputes per frame and is happy to flicker. A step further than
+  `AGC_JUMP` (2048 counts) resets instead of easing, since that is a resolution
+  or phase change rather than drift.
 
 JPEG encoding uses the **P4 hardware encoder** (`JPEG_ENCODE_IN_FORMAT_GRAY`),
 so it costs almost no CPU. The AGC pass is the expensive part.
@@ -394,24 +517,30 @@ Only needed when the C6 firmware changed. P4-only rebuild:
 ### Healthy boot
 ```
 thermal_dvp: VSYNC invert = 1 / DE mode 0 / HSYNC invert = 0 / PCLK invert = 0
-thermal_dvp: DVP open: 384x288 @50 fps out, 270336 bytes/frame, parity_filter=1 keep_parity=1
+thermal_dvp: DVP open: 384x288 @50 fps out, 696320 bytes/frame, parity_filter=1 keep_parity=1
 uvc_stream:  Thermal bridge ready: 384x288 Y16 @50 fps, 221184 B/frame
 cam_uart:    UART1 up: TX=IO29 RX=IO28 @ 38400 8N1
 wifi_con:    Wi-Fi (C6 over SDIO) up in STA mode, power save off
 web_stream:  HTTP server up on :80
 usbd_uvc:    Mount / Commit / Starting: 384x288 @50fps
 ```
-Note 270336 (capture, includes the vblank margin) vs 221184 (delivered).
+Note 696320 (the CAPTURE buffer — always sized for the largest advertised
+frame, 640 x (480+64) x 2, regardless of the active resolution) vs 221184
+(delivered, 384x288x2). The two only converge on a 640x480 module.
 
 ### No frames: the ISR counters
 ```
-W thermal_dvp: frame timeout — get_new=N finished=N no_free=N recv=N/N
+W thermal_dvp: frame timeout — get_new=N finished=N no_free=N torn=N recv=N/N
 ```
 | `get_new` | `finished` | Meaning |
 |-----------|-----------|---------|
 | 0 | 0 | ISR never fires. Camera unpowered, or VSYNC polarity so wrong no frame boundary is seen. |
 | 1 | 0 | Started but never completed. PCLK toggling, no valid VSYNC. |
 | >1 | >1 | Captures work; the problem is downstream (consumer or phase filter). |
+
+`torn` counts captures the phase classifier's dead band rejected as straddling
+two frames — the DMA was rearmed after the next frame had already begun. Near
+zero is healthy; a climbing count is the desync glitch.
 
 If `finished` climbs but a *viewer* sees nothing, suspect the consumer, not the
 DVP. That is exactly how the web stream's zero-frame bug presented.
@@ -435,11 +564,12 @@ On Linux: `v4l2-ctl --set-fmt-video=pixelformat=Y16`.
 Tk + OpenCV. Settings persist by rewriting the `SETTINGS` block in the file
 itself, no external config.
 
-- The viewer's resolution list is pinned to **384x288**. The firmware supports
-  both 384x288 and 640x480 camera models (set `CONFIG_THERMAL_WIDTH/HEIGHT`),
-  but selecting the 640x480 frame at runtime against a 384-wide camera crashes,
-  so the picker was reduced to one entry rather than left as a trap. Switching
-  models is an sdkconfig change plus editing `RESOLUTIONS` here.
+- `RESOLUTIONS` lists **both 384x288 and 640x480** — both camera modules are
+  supported live. Picking one re-commits UVC and sends `RES,W,H` so the
+  firmware persists it to NVS. On connect the viewer queries bare `RES` and
+  snaps its combo to the persisted preference, so the label and the decode
+  cannot disagree. Selecting a size that does not match the module physically
+  attached frames garbage until you set it back — it does not crash.
 - Histogram: log-scaled, selectable axis (Min/Max, Full range, Manual), and
   **Bars or Line**. Gaps are interpolated across empty bins *between* populated
   ones, because real values often land on a coarse lattice (8-bit mode, camera

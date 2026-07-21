@@ -11,7 +11,6 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_attr.h"
-#include "esp_cache.h"
 #include "esp_cam_ctlr_dvp.h"
 #include "esp_private/esp_cam_dvp.h"
 #include "esp_rom_gpio.h"
@@ -22,6 +21,7 @@
 #include "hal/cam_ll.h"         /* cam_ll_set_input_data_width (force 16-bit) */
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "thermal_dvp";
 
@@ -292,6 +292,7 @@ esp_err_t camera_start(camera_ctx_t *ctx)
     ctx->dbg_get_new_calls = 0;
     ctx->dbg_finished      = 0;
     ctx->dbg_no_free       = 0;
+    ctx->dbg_torn          = 0;
 
     portENTER_CRITICAL(&ctx->lock);
     for (int i = 0; i < DVP_BUFFER_COUNT; i++) {
@@ -394,9 +395,29 @@ esp_err_t camera_stop(camera_ctx_t *ctx)
 const uint16_t *camera_get_frame(camera_ctx_t *ctx, void **out_buf,
                                   uint32_t timeout_ms)
 {
-    TickType_t ticks = (timeout_ms == portMAX_DELAY)
-                       ? portMAX_DELAY
-                       : pdMS_TO_TICKS(timeout_ms);
+    /*
+     * timeout_ms is an OVERALL deadline, not a per-wait timeout.
+     *
+     * It used to be per-wait, and that hung the web stream for as long as a USB
+     * host was attached. The ISR gives frame_sem on EVERY capture (50/s), so a
+     * consumer that keeps losing the buffer race — the prio-5 mjpeg task against
+     * the prio-23 UVC task — woke, found nothing READY, and re-armed the FULL
+     * timeout on the next take, which the next give satisfied ~20 ms later. The
+     * "timed out" branch needs `timeout_ms` of total semaphore SILENCE to be
+     * reached, which never happens while the DVP is running, so the starved
+     * caller spun in here indefinitely. It only escaped when the UVC host went
+     * away and stopped claiming buffers.
+     *
+     * That wedged the mjpeg task with s_web.client_busy still set, so every
+     * later /stream request 503'd after its 2 s wait for the incumbent to
+     * release — the ~2 s "httpd_uri: uri handler execution failed" cadence.
+     *
+     * A single deadline captured at entry also bounds the wrong-phase retry
+     * path below, which re-armed the timeout the same way on every drop.
+     */
+    const bool           infinite = (timeout_ms == portMAX_DELAY);
+    const TickType_t     budget   = infinite ? 0 : pdMS_TO_TICKS(timeout_ms);
+    const TickType_t     started  = xTaskGetTickCount();
 
     int idx = -1;
     for (;;) {
@@ -421,18 +442,41 @@ const uint16_t *camera_get_frame(camera_ctx_t *ctx, void **out_buf,
         portEXIT_CRITICAL(&ctx->lock);
 
         if (idx < 0) {
-            if (xSemaphoreTake(ctx->frame_sem, ticks) == pdTRUE) {
+            /* Time left on the deadline. Tick subtraction wraps correctly. */
+            TickType_t left = portMAX_DELAY;
+            if (!infinite) {
+                TickType_t spent = xTaskGetTickCount() - started;
+                left = (spent >= budget) ? 0 : (budget - spent);
+            }
+            if (left > 0 && xSemaphoreTake(ctx->frame_sem, left) == pdTRUE) {
                 continue;   /* a capture completed — go claim it */
             }
-            /* Throttle: at 25 fps this would spam ~25 lines/s and bury the
-             * console prompt. Log roughly once a second. */
-            static uint32_t to_count;
-            if ((to_count++ % 25u) == 0) {
-                ESP_LOGW(TAG, "frame timeout — get_new=%"PRIu32" finished=%"PRIu32" no_free=%"PRIu32
-                         " recv=%"PRIu32"/%zu (vsync_inv=%d de_mode=%d)",
-                         ctx->dbg_get_new_calls, ctx->dbg_finished, ctx->dbg_no_free,
-                         ctx->dbg_recv_size, ctx->buf_size,
-                         ctx->vsync_invert, ctx->de_mode);
+
+            /*
+             * Out of time. Two very different reasons land here, and only one
+             * of them is a fault:
+             *
+             *   captures ADVANCED  — the DVP is healthy, this caller just lost
+             *     every buffer race (a low-priority consumer under UVC load).
+             *     Normal contention; the caller retries. Debug level only.
+             *   captures did NOT advance — the CAM really has gone quiet.
+             *     That is the fault case, and the stall watchdog below owns it.
+             */
+            bool progressing = (ctx->dbg_finished != ctx->stall_last_finished);
+            if (progressing) {
+                ESP_LOGD(TAG, "starved (finished=%"PRIu32", no buffer won this window)",
+                         ctx->dbg_finished);
+            } else {
+                /* Throttle: at 25 fps this would spam ~25 lines/s and bury the
+                 * console prompt. Log roughly once a second. */
+                static uint32_t to_count;
+                if ((to_count++ % 25u) == 0) {
+                    ESP_LOGW(TAG, "frame timeout — get_new=%"PRIu32" finished=%"PRIu32" no_free=%"PRIu32
+                             " torn=%"PRIu32" recv=%"PRIu32"/%zu (vsync_inv=%d de_mode=%d)",
+                             ctx->dbg_get_new_calls, ctx->dbg_finished, ctx->dbg_no_free,
+                             ctx->dbg_torn, ctx->dbg_recv_size, ctx->buf_size,
+                             ctx->vsync_invert, ctx->de_mode);
+                }
             }
 
             /*
@@ -460,11 +504,25 @@ const uint16_t *camera_get_frame(camera_ctx_t *ctx, void **out_buf,
             return NULL;
         }
 
-        /* Invalidate the cache so the CPU sees the DMA-written PSRAM data.
-         * Only the active image (frame_size) is ever read — the classifier,
-         * the freeze hash, and the USB copy all stop there — so skip the
-         * DVP_VBLANK_CAPTURE_MARGIN tail to shave time off the cycle. */
-        esp_cache_msync(ctx->bufs[idx], ctx->frame_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        /*
+         * NO cache invalidate here — it would be pure duplicated work.
+         *
+         * The IDF 6.0.1 DVP ISR already invalidated this ENTIRE buffer before
+         * it published it: esp_cam_ctlr_recv_frame_done_isr() calls
+         * esp_cam_ctlr_dvp_get_recved_size(), which does an unconditional
+         * esp_cache_msync(rx_buffer, fb_size_in_bytes, M2C) for any buffer in
+         * external RAM (ours are all PSRAM) — and only then invokes
+         * on_trans_finished, i.e. the callback that marked this buffer READY.
+         * So by the time we can possibly see BUF_READY, the data is coherent.
+         *
+         * The msync that used to be here re-invalidated frame_size (221 KB at
+         * 384x288) on the consumer's core, inside esp_cache_msync's spinlock
+         * with interrupts disabled, once per delivered frame, for no effect.
+         *
+         * (If the driver is ever updated such that it no longer syncs before
+         * the callback, this must come back — the check is the msync call in
+         * esp_cam_ctlr_dvp_get_recved_size() in esp_cam_ctlr_dvp_cam.c.)
+         */
 
         /*
          * Interleaved-phase (A/B) selection BY CONTENT, not by capture parity.
@@ -496,8 +554,37 @@ const uint16_t *camera_get_frame(camera_ctx_t *ctx, void **out_buf,
                     hot++;
                 }
             }
-            bool is_thermal = (hot * 2u) > total;   /* >50% of pixels are high */
-            uint32_t phase = is_thermal ? 1u : 0u;
+            /*
+             * DEAD BAND around the 50% line. A bare majority (hot*2 > total)
+             * classifies every frame as one phase or the other, including a
+             * TORN one — a capture whose DMA was rearmed late, so it holds the
+             * tail of one phase followed by the head of the next. Those land
+             * near 50/50 and the vote becomes a coin flip, which is how a
+             * half-video/half-thermal frame reaches the consumer.
+             *
+             * It is visible in two ways, and both are on the reported symptom
+             * list: the image appears shifted sideways (the seam), and the web
+             * AGC sees a bimodal histogram — an 8-bit lobe near 0 plus the
+             * ~7000-count thermal lobe — which drags `lo` to the bottom of the
+             * range and washes the frame out for the one or two frames it
+             * takes to pass through.
+             *
+             * A clean phase is overwhelmingly one-sided (thermal has a ~7000
+             * baseline so virtually every pixel is >0xFF; video is <=0xFF apart
+             * from a few glowing spots), so demanding 75% costs nothing on
+             * healthy frames and rejects the mixed ones outright. Anything in
+             * the band is dropped like a wrong-phase frame — the next capture
+             * is 20 ms away.
+             */
+            uint32_t phase;
+            if (hot * 4u > total * 3u) {
+                phase = 1u;                   /* >75% high — clean thermal */
+            } else if (hot * 4u < total) {
+                phase = 0u;                   /* <25% high — clean 8-bit video */
+            } else {
+                ctx->dbg_torn++;              /* mixed — a torn capture */
+                phase = !ctx->keep_parity;    /* force the drop path below */
+            }
             if (phase != ctx->keep_parity) {
                 portENTER_CRITICAL(&ctx->lock);
                 ctx->state[idx] = BUF_FREE;   /* wrong phase — drop, wait for the other */
@@ -580,12 +667,31 @@ const uint16_t *camera_get_frame(camera_ctx_t *ctx, void **out_buf,
      * gets literally zero frames, not a fair share. Copying costs one memcpy
      * on whoever is already consuming, and only while a tap is pending.
      */
+    /*
+     * CLAIM the request under the lock before copying, and hold tap_busy for
+     * the duration. Testing tap_pending and clearing it after the memcpy (as
+     * this did) races with camera_tap_get()'s timeout path: the reader could
+     * time out mid-copy, clear tap_pending, return false, then come straight
+     * back, drain tap_sem, re-arm — and catch the give from the copy that was
+     * still in flight, reading tap_buf while we were writing it. That hands
+     * the JPEG encoder a frame seamed from two captures, which shows up in the
+     * browser as a sideways tear and a one-frame AGC lurch.
+     */
+    bool do_tap = false;
+    portENTER_CRITICAL(&ctx->lock);
     if (ctx->tap_pending && ctx->tap_buf) {
-        memcpy(ctx->tap_buf, ctx->bufs[idx], ctx->frame_size);
-        ctx->tap_bytes   = ctx->frame_size;
-        ctx->tap_width   = ctx->width;
-        ctx->tap_height  = ctx->height;
         ctx->tap_pending = false;
+        ctx->tap_busy    = true;
+        do_tap = true;
+    }
+    portEXIT_CRITICAL(&ctx->lock);
+
+    if (do_tap) {
+        memcpy(ctx->tap_buf, ctx->bufs[idx], ctx->frame_size);
+        ctx->tap_bytes  = ctx->frame_size;
+        ctx->tap_width  = ctx->width;
+        ctx->tap_height = ctx->height;
+        ctx->tap_busy   = false;
         xSemaphoreGive(ctx->tap_sem);
     }
 
@@ -606,25 +712,60 @@ esp_err_t camera_tap_init(camera_ctx_t *ctx, size_t max_bytes)
     return ESP_OK;
 }
 
-bool camera_tap_get(camera_ctx_t *ctx, uint16_t *dst, size_t dst_bytes,
-                    uint32_t *out_w, uint32_t *out_h, uint32_t timeout_ms)
+const uint16_t *camera_tap_borrow(camera_ctx_t *ctx, uint32_t *out_w,
+                                   uint32_t *out_h, uint32_t timeout_ms)
 {
     if (!ctx->tap_buf) {
-        return false;
+        return NULL;
     }
+    /*
+     * Never re-arm while a copy from the previous round is still running —
+     * that is the other half of the claim in camera_get_frame(). A short
+     * bounded wait is enough: tap_busy only spans one memcpy.
+     */
+    for (int i = 0; i < 10 && ctx->tap_busy; i++) {
+        vTaskDelay(1);
+    }
+
     /* Drain any stale give so we wait for a frame captured after this call. */
     xSemaphoreTake(ctx->tap_sem, 0);
     ctx->tap_pending = true;
 
     if (xSemaphoreTake(ctx->tap_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        /*
+         * Withdraw the request — but only if it has not already been claimed.
+         * If a consumer took it while we were timing out, the copy is in
+         * flight and tap_buf is being written; give it a brief grace period
+         * rather than returning to a caller that would re-arm on top of it.
+         */
+        bool claimed;
+        portENTER_CRITICAL(&ctx->lock);
+        claimed = !ctx->tap_pending;         /* consumer already took it */
         ctx->tap_pending = false;
-        return false;                        /* nobody is consuming frames */
+        portEXIT_CRITICAL(&ctx->lock);
+
+        if (claimed && xSemaphoreTake(ctx->tap_sem, pdMS_TO_TICKS(20)) == pdTRUE) {
+            goto have_frame;                 /* the copy landed after all */
+        }
+        return NULL;                         /* nobody is consuming frames */
     }
-    size_t n = ctx->tap_bytes < dst_bytes ? ctx->tap_bytes : dst_bytes;
-    memcpy(dst, ctx->tap_buf, n);
+
+have_frame:
+    /*
+     * BORROW, don't copy. tap_buf is written only by a consumer that has
+     * claimed a tap_pending request, and only this reader ever sets that flag
+     * — so once we are here, tap_buf is stable until our next call, and the
+     * tap_busy spin at the top of this function guarantees the previous copy
+     * has finished before we re-arm.
+     *
+     * This used to memcpy tap_buf into a caller-owned buffer, which meant the
+     * frame crossed PSRAM twice on its way to the encoder: once when the
+     * consumer copied the DMA buffer into tap_buf, once again here. At 640x480
+     * that second copy was 614 KB per web frame for no benefit.
+     */
     if (out_w) *out_w = ctx->tap_width;
     if (out_h) *out_h = ctx->tap_height;
-    return true;
+    return (const uint16_t *)ctx->tap_buf;
 }
 
 void camera_release_frame(camera_ctx_t *ctx, void *buf)
