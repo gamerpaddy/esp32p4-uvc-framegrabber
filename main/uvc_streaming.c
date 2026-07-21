@@ -63,11 +63,13 @@ static esp_err_t on_stream_start(uvc_format_t uvc_format, int width, int height,
 
     ESP_LOGI(TAG, "Stream start: %dx%d @%dfps (Y16)", ctx->width, ctx->height, rate);
 
-    /* Match the delivered frame size to what the host committed. */
+    /* Match the delivered frame size to what the host committed. Do NOT
+     * persist here — the host may just be using its own combo default rather
+     * than an explicit user pick, and saving that would clobber the user's
+     * preference (e.g. py viewer opens at 384 on launch → saved 384 → next
+     * boot restored 384 even though the user picked 640). Persistence is
+     * driven only by explicit "RES,W,H" commands from the web/console/viewer. */
     camera_set_resolution(&ctx->camera, ctx->width, ctx->height);
-    /* Also persist it so the web-only path (post-reboot, no host yet) comes
-     * back on the same resolution the last host was using. */
-    settings_set_resolution(ctx->width, ctx->height);
 
     esp_err_t ret = camera_start(&ctx->camera);
     if (ret != ESP_OK) {

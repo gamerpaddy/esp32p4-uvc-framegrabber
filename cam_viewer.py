@@ -895,6 +895,11 @@ class Viewer(tk.Tk):
     def _set_resolution(self):
         w, h = self._res_dims(self.res.get())
         self._restart_cam(w, h)
+        # Persist on the P4 too so a later boot / a web viewer / another host
+        # comes up on the same resolution instead of the firmware Kconfig one.
+        # The UVC re-commit alone doesn't save (host default vs user intent).
+        if HAVE_SERIAL and self.serial.is_open():
+            self.serial.send(f"RES,{w},{h}")
         self._flash(f"resolution -> {w}x{h}")
 
     def _reload(self):

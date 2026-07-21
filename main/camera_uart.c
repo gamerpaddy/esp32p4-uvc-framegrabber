@@ -302,15 +302,21 @@ esp_err_t camera_uart_submit_line(const char *line)
      * Supported pairs mirror what the UVC descriptor advertises.
      */
     if (strcmp(cmd, "RES") == 0) {
-        /* Bare "RES" (no value) is a QUERY — emit the current delivered
-         * resolution so the py viewer can adopt what the P4 is actually on
-         * before it commits UVC (otherwise it opens at its own combo default
-         * and clobbers the persisted resolution back to that on every launch). */
+        /* Bare "RES" (no value) is a QUERY — return the user's PERSISTED
+         * preference from NVS, not whatever the camera happens to be on right
+         * now. The py viewer opens UVC at its saved combo default before the
+         * serial query fires, so a "current-resolution" reply would just echo
+         * what the viewer already committed and leave a mismatched combo. The
+         * persisted preference is the authoritative "what the user wants" so
+         * the viewer can snap to it and re-commit UVC accordingly. */
         if (val[0] == 0) {
-            if (s_cam) {
+            uint32_t pw = 0, ph = 0;
+            if (settings_get_resolution(&pw, &ph) != ESP_OK) {
+                if (s_cam) { pw = s_cam->width; ph = s_cam->height; }
+            }
+            if (pw && ph) {
                 char msg[32];
-                snprintf(msg, sizeof(msg), "RES,%u,%u",
-                         (unsigned)s_cam->width, (unsigned)s_cam->height);
+                snprintf(msg, sizeof(msg), "RES,%u,%u", (unsigned)pw, (unsigned)ph);
                 cdc_line(msg); log_append(msg);
             }
             return ESP_OK;

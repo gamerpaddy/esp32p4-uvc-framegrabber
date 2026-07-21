@@ -507,34 +507,18 @@ const uint16_t *camera_get_frame(camera_ctx_t *ctx, void **out_buf,
             }
         }
         /*
-         * Line-alignment guard. The DMA writes samples linearly, so if the
-         * sensor drops a few PCLK samples inside a line (transient PCLK/HSYNC
-         * glitch) every byte after the drop lands one position too far left
-         * and the frame renders as sideways-shear until the next VSYNC resets.
-         * The observable tell is that received_size for the bad frame comes
-         * out SHORTER than the active image needs — the DMA never wrote the
-         * bytes we're about to hand to a consumer. Drop those.
-         * Frames where received_size is at least the active image AND is a
-         * whole-line multiple pass through untouched. Frames where it's a
-         * partial line beyond the active image also pass — the extra bytes
-         * are past frame_size and never read, and rejecting those would
-         * false-positive on the vblank-margin captures that are the normal
-         * healthy pattern here.
+         * NOTE: an earlier shear-guard that dropped frames whose received_size
+         * was less than frame_size regressed the web viewer to ~9 fps and
+         * caused "handler execution failed" spam — the driver's received_size
+         * field is not populated the way that check assumed, so it fired on
+         * healthy captures. Left as a diagnostic log only until a real shear
+         * signature is worked out.
          */
         {
-            uint32_t recv = ctx->buf_recv[idx];
-            uint32_t line = ctx->width * 2u;
-            if (line && recv < ctx->frame_size) {
-                static uint32_t drop_count;
-                if ((drop_count++ % 25u) == 0) {
-                    ESP_LOGW(TAG, "shear-guard drop: recv=%"PRIu32" B < frame=%zu B (drops=%"PRIu32")",
-                             recv, ctx->frame_size, drop_count);
-                }
-                portENTER_CRITICAL(&ctx->lock);
-                ctx->state[idx] = BUF_FREE;
-                portEXIT_CRITICAL(&ctx->lock);
-                idx = -1;
-                continue;
+            static uint32_t log_gate;
+            if ((log_gate++ % 250u) == 0) {
+                ESP_LOGD(TAG, "recv=%"PRIu32" B (frame=%zu B, buf=%zu B)",
+                         ctx->buf_recv[idx], ctx->frame_size, ctx->buf_size);
             }
         }
         break;
