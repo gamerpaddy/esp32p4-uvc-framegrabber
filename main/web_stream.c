@@ -565,12 +565,24 @@ static esp_err_t index_handler(httpd_req_t *req)
 "const c=new Uint8Array(a.length+b.length);"
 "c.set(a);c.set(b,a.length);return c;"
 "}"
+/* Stall watchdog: if no JPEG has been decoded in STALL_MS, abort the fetch so
+   the outer loop reconnects. Covers three failure shapes seen in the wild:
+   (1) TCP half-open where read() never resolves, (2) server stuck between
+   frames, (3) Wi-Fi drop mid-stream that leaves the socket dangling. */
+"const STALL_MS=2500;"
+"let lastFrameTs=performance.now();"
 "async function drawStream(){"
-"const resp=await fetch('/stream',{cache:'no-store'});"
+"const ac=new AbortController();"
+"const wd=setInterval(()=>{"
+"if(performance.now()-lastFrameTs>STALL_MS)ac.abort();"
+"},500);"
+"try{"
+"const resp=await fetch('/stream',{cache:'no-store',signal:ac.signal});"
 "if(!resp.body)throw new Error('no stream body');"
 "const reader=resp.body.getReader();"
 "const td=new TextDecoder();"
 "let buf=new Uint8Array(0);"
+"lastFrameTs=performance.now();"
 "while(true){"
 "const {value,done}=await reader.read();"
 "if(done)break;"
@@ -592,12 +604,14 @@ static esp_err_t index_handler(httpd_req_t *req)
 "try{"
 "const bmp=await createImageBitmap(new Blob([jpeg],{type:'image/jpeg'}));"
 "drawFrame(bmp);bmp.close();"
+"lastFrameTs=performance.now();"
 "}catch(e){}"
 "}"
 /* Keep the working buffer from growing unbounded on partial matches (shouldn't
    happen with a healthy stream, but be safe). */
 "if(buf.length>200000)buf=buf.slice(-100000);"
 "}"
+"}finally{clearInterval(wd);}"
 "}"
 "(async function loop(){"
 "while(true){"
