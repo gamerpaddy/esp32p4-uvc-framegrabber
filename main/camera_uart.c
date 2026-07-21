@@ -16,6 +16,9 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "tusb.h"   /* CDC-ACM: the command console rides the composite USB device */
+#include "uvc_streaming.h"
+#include "uvc_frame_config.h"    /* THERMAL_MAX_WIDTH/HEIGHT/PIXELS */
+#include "settings.h"
 
 static const char *TAG = "cam_uart";
 
@@ -287,6 +290,59 @@ esp_err_t camera_uart_submit_line(const char *line)
         const char *msg = inv ? "PCK,1 (falling edge)" : "PCK,0 (rising edge)";
         cdc_line(msg);
         log_append(msg);
+        return ESP_OK;
+    }
+    /*
+     * "RES,W,H" is a LOCAL command: notify the host viewer to renegotiate
+     * UVC at the new frame size, and — when the USB host is NOT already
+     * pulling frames — apply the change directly so the web MJPEG stream
+     * follows immediately. When UVC is committed the resolution is host-owned
+     * (frame_size drives the in-flight fb.len); we must not race it, so we
+     * only emit the signal and let the py viewer drive on_stream_start.
+     * Supported pairs mirror what the UVC descriptor advertises.
+     */
+    if (strcmp(cmd, "RES") == 0) {
+        int w = 0, h = 0;
+        if (sscanf(val, "%d,%d", &w, &h) != 2) {
+            const char *msg = "RES: expected RES,W,H";
+            cdc_line(msg); log_append(msg);
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* Bound each dimension to what the DVP h_res/v_res was configured for
+         * at open time (larger values would truncate lines silently), and cap
+         * the product to a pixel budget so unusual aspect ratios don't blow
+         * past the buffer footprint we sized for. */
+        if (w <= 0 || h <= 0 ||
+            w > THERMAL_MAX_WIDTH || h > THERMAL_MAX_HEIGHT ||
+            (unsigned)(w * h) > THERMAL_MAX_PIXELS) {
+            char msg[80];
+            snprintf(msg, sizeof(msg),
+                     "RES: %dx%d rejected (max %dx%d, %d pixels)",
+                     w, h, THERMAL_MAX_WIDTH, THERMAL_MAX_HEIGHT,
+                     THERMAL_MAX_PIXELS);
+            cdc_line(msg); log_append(msg);
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* Emit the signal FIRST so the py viewer, which is watching the CDC
+         * port, starts renegotiating in parallel with any local apply. */
+        char msg[32];
+        snprintf(msg, sizeof(msg), "RES,%d,%d", w, h);
+        cdc_line(msg); log_append(msg);
+
+        if (!uvc_stream_is_active() && s_cam) {
+            camera_stop(s_cam);
+            esp_err_t r = camera_set_resolution(s_cam, (uint32_t)w, (uint32_t)h);
+            camera_start(s_cam);
+            if (r != ESP_OK) {
+                const char *e = "RES: apply failed";
+                cdc_line(e); log_append(e);
+                return r;
+            }
+        }
+        /* Persist so the next boot comes up on the resolution the user picked,
+         * for both web-only and UVC paths (on_stream_start also saves what the
+         * host committed, so whichever channel touched it last wins). */
+        settings_set_resolution((uint32_t)w, (uint32_t)h);
         return ESP_OK;
     }
     /* Anything else is forwarded to the camera. camera_uart_send() logs the

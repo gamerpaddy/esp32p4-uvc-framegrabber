@@ -43,7 +43,7 @@ DEVICE_INDEX = 0
 MAXV = 16383  # 14-bit full scale
 
 # Selectable resolutions (must match the frames advertised by the firmware).
-RESOLUTIONS = [("384 x 288", 384, 288)]
+RESOLUTIONS = [("384 x 288", 384, 288), ("640 x 480", 640, 480)]
 CLIP_PCT = 0.5  # ignore the outer 5% of pixels (each tail) when measuring the range
 
 # ==== SAVED SETTINGS (rewritten in place by the GUI "Save settings" button) ====
@@ -824,6 +824,22 @@ class Viewer(tk.Tk):
         self._send_cmd(f"{cmd},{val}" if val else cmd)
 
     def _show_reply(self, s):
+        # "RES,W,H" is emitted by the P4 when a resolution switch is requested
+        # (from the web UI, or the P4's own console). Match the UVC size to it
+        # and restart the capture so the host committed frame stays in sync
+        # with what the firmware is delivering.
+        m_res = re.match(r"^RES,(\d+),(\d+)$", s)
+        if m_res:
+            w, h = int(m_res.group(1)), int(m_res.group(2))
+            name = next((n for n, rw, rh in RESOLUTIONS if rw == w and rh == h), None)
+            if name:
+                self.res.set(name)
+                self._restart_cam(w, h)
+                self._flash(f"resolution -> {w}x{h}")
+                self._append_return(f"RES: switched to {w}x{h}", "ok")
+            else:
+                self._append_return(f"RES: {w}x{h} not in RESOLUTIONS list", "warn")
+            return
         m = re.match(r"^([A-Z]{3}),(\d)(?:,(.*))?$", s)
         if not m:
             self._append_return(s)

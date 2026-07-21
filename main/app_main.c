@@ -13,12 +13,17 @@
 #include "camera_uart.h"
 #include "wifi_console.h"
 #include "web_stream.h"
+#include "settings.h"
 
 static const char *TAG = "app_main";
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== ESP32-P4 Thermal UVC Bridge ===");
+
+    /* NVS up first — settings_get_resolution() is consulted during
+     * uvc_stream_init() to restore the last-used delivered frame size. */
+    settings_init();
 
     esp_err_t ret = camera_init();
     if (ret != ESP_OK) {

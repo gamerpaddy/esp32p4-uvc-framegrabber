@@ -28,6 +28,12 @@ typedef struct {
 /* Initialize UVC pipeline: open camera, register callbacks, start USB. */
 esp_err_t uvc_stream_init(uvc_stream_ctx_t *ctx);
 
+/* True when a host has committed and is actively pulling frames. The camera
+ * resolution is host-owned in that state; anything that wants to change it
+ * must go through UVC re-commit (i.e. tell the host viewer to reopen), not
+ * touch the pipeline directly, or the in-flight frame length desyncs. */
+bool uvc_stream_is_active(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -27,11 +27,27 @@
  * The host (viewer) selects which one; the ESP delivers that many bytes/frame.
  * The primary MUST be the larger of the two (buffers are sized from it).
  */
-#define THERMAL_WIDTH    CONFIG_THERMAL_WIDTH    /* frame 1 / max width  */
-#define THERMAL_HEIGHT   CONFIG_THERMAL_HEIGHT   /* frame 1 / max height */
-#define THERMAL_WIDTH2   384                     /* frame 2 width        */
-#define THERMAL_HEIGHT2  288                     /* frame 2 height       */
+#define THERMAL_WIDTH    CONFIG_THERMAL_WIDTH    /* frame 1 = boot/default */
+#define THERMAL_HEIGHT   CONFIG_THERMAL_HEIGHT
+#define THERMAL_WIDTH2   640                     /* frame 2 = alternate    */
+#define THERMAL_HEIGHT2  480
 #define THERMAL_FPS      CONFIG_THERMAL_FPS
+
+/*
+ * Runtime resolution budget for RES,W,H and UVC re-commits. Buffer allocations
+ * (capture DMA, UVC transfer, nosignal, tap) are sized once to these hard
+ * caps so any accepted W x H fits without reallocation:
+ *   - THERMAL_MAX_WIDTH / _HEIGHT bound each dimension individually (they set
+ *     the DVP h_res/v_res, which are fixed at controller-init and truncate
+ *     anything larger).
+ *   - THERMAL_MAX_PIXELS additionally bounds the product so unusual aspect
+ *     ratios don't blow past the intended memory footprint.
+ * ~500k pixels covers 640x480 with comfortable headroom; bump the per-dim
+ * caps if a wider or taller sensor shows up.
+ */
+#define THERMAL_MAX_WIDTH   800
+#define THERMAL_MAX_HEIGHT  640
+#define THERMAL_MAX_PIXELS  500000
 
 /* Bytes per pixel for the Y16 format (2 bytes = 16-bit). */
 #define THERMAL_BPP     2

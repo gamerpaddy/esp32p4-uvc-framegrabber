@@ -34,6 +34,7 @@
 
 #include "web_stream.h"
 #include "camera_uart.h"
+#include "uvc_frame_config.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -56,10 +57,12 @@
 static const char *TAG = "web_stream";
 
 /* Buffers are sized once for the largest frame the pipeline can deliver, so a
- * camera_set_resolution() while the server is up cannot outgrow them. PSRAM. */
-#define WEB_MAX_W        640
-#define WEB_MAX_H        480
-#define WEB_MAX_PIXELS   (WEB_MAX_W * WEB_MAX_H)
+ * camera_set_resolution() while the server is up cannot outgrow them. Track
+ * THERMAL_MAX_* (uvc_frame_config.h) so bumping the pixel budget in one place
+ * propagates here. PSRAM. */
+#define WEB_MAX_W        THERMAL_MAX_WIDTH
+#define WEB_MAX_H        THERMAL_MAX_HEIGHT
+#define WEB_MAX_PIXELS   THERMAL_MAX_PIXELS
 
 #define WEB_JPEG_QUALITY 80
 #define WEB_FRAME_TIMEOUT_MS 500
@@ -451,6 +454,15 @@ static esp_err_t index_handler(httpd_req_t *req)
 "<div class=bitrow>"
 "<button data-cmd='BIT,8'>8-bit (menu)</button>"
 "<button data-cmd='BIT,14'>14-bit thermal</button>"
+"</div>"
+
+/* Resolution switch. When a py viewer is attached it listens for RES,W,H on
+   the CDC port and renegotiates UVC — otherwise the P4 applies the new size
+   locally so the web MJPEG picks it up on the next frame. Wrong size vs the
+   physical camera model produces garbage frames (see CLAUDE.md). */
+"<div class=bitrow>"
+"<button data-cmd='RES,384,288'>384 x 288</button>"
+"<button data-cmd='RES,640,480'>640 x 480</button>"
 "</div>"
 
 "<form id=cmdform autocomplete=off>"

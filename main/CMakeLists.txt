@@ -4,6 +4,7 @@ idf_component_register(
         "camera_pipeline.c"
         "uvc_streaming.c"
         "camera_uart.c"
+        "settings.c"
         "wifi_console.c"
         "net_bench.c"
         "c6_debug.c"

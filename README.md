@@ -10,7 +10,7 @@ this not only includes Thermal cameras but all parallel video devices  that outp
 
 
 **IT IS CURRENTLY** adjusted to work with the Dali D8X3C cameras, i plan on making adapter boards for FLIR tau2 soon and adjust the software to work with it.
-This software supports the 384x288 and 640x480 models, but you have to adjust the sdkconfig accordingly.  will polish that later.
+Both the 384x288 and 640x480 Dali cams work out of the same firmware now — the delivered frame size is switched at runtime with `RES,W,H` (from the web UI buttons, the Python viewer, or the CDC console) and the choice is persisted in NVS so the board comes back on the same resolution after a reboot. The USB host can also just commit whichever advertised UVC frame size it wants and the firmware follows. The old sdkconfig-only limit is gone; any `W x H` up to ~500k pixels is accepted, so bringing up a different parallel sensor later is a runtime setting rather than a rebuild.
 
 <img width="902" height="770" alt="python_Bm7e6duyqK" src="https://github.com/user-attachments/assets/4aec61b1-696f-41f5-a50b-d30f818b4785" />
 

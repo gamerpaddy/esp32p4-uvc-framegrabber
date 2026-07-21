@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include "camera_pipeline.h"
 #include "sdkconfig.h"
+#include "uvc_frame_config.h"   /* THERMAL_MAX_WIDTH / THERMAL_MAX_HEIGHT */
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_attr.h"
@@ -122,9 +123,15 @@ esp_err_t camera_open(camera_ctx_t *ctx)
     ctx->height     = CONFIG_THERMAL_HEIGHT;
     ctx->frame_size = ctx->width * ctx->height * 2;   /* delivered Y16 frame */
     /* Capture taller than the active image so the GDMA chain never fills before
-     * VSYNC (see DVP_VBLANK_CAPTURE_MARGIN). */
-    ctx->cap_height = ctx->height + DVP_VBLANK_CAPTURE_MARGIN;
-    ctx->buf_size   = ctx->width * ctx->cap_height * 2; /* DMA capture size */
+     * VSYNC (see DVP_VBLANK_CAPTURE_MARGIN). Buffers are sized for the LARGEST
+     * advertised frame so runtime RES,W,H switches don't overrun them; only the
+     * fraction actually filled changes with the active resolution. */
+    /* Size the CAM controller's expected v_res AND the DMA buffer to the tallest
+     * advertised frame — v_res is a one-shot config on the DVP peripheral, so
+     * switching to a larger frame at runtime with v_res still sized to the
+     * smaller one truncates every line past the smaller height. */
+    ctx->cap_height = THERMAL_MAX_HEIGHT + DVP_VBLANK_CAPTURE_MARGIN;
+    ctx->buf_size   = THERMAL_MAX_WIDTH * ctx->cap_height * 2;
     portMUX_INITIALIZE(&ctx->lock);
 
     ctx->parity_filter = true;   /* always drop the 8-bit video phase */
@@ -198,8 +205,8 @@ esp_err_t camera_open(camera_ctx_t *ctx)
     esp_cam_ctlr_dvp_config_t dvp_cfg = {
         .ctlr_id                = 0,
         .clk_src                = CAM_CLK_SRC_DEFAULT,
-        .h_res                  = ctx->width,
-        .v_res                  = ctx->cap_height,   /* taller than active → VSYNC is sole frame delimiter */
+        .h_res                  = THERMAL_MAX_WIDTH,   /* sized for the biggest advertised frame */
+        .v_res                  = ctx->cap_height,     /* max height + vblank margin */
         .input_data_color_type  = CAM_CTLR_COLOR_RGB565,
         .output_data_color_type = CAM_CTLR_COLOR_RGB565,
         .cam_data_width         = 16,

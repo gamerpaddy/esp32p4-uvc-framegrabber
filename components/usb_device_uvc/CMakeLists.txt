@@ -1,5 +1,5 @@
 idf_component_register(SRCS usb_device_uvc.c
-                    INCLUDE_DIRS "include"
+                    INCLUDE_DIRS "include" "tusb"
                     REQUIRES esp_timer esp_hw_support)
 
 idf_component_get_property(tusb_lib espressif__tinyusb COMPONENT_LIB)

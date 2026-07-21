@@ -24,10 +24,25 @@
 #include "usb_device_uvc.h"
 #include "uvc_streaming.h"
 #include "uvc_frame_config.h"
+#include "settings.h"
 
 static const char *TAG = "uvc_stream";
 
-#define FRAME_BYTES  (THERMAL_WIDTH * THERMAL_HEIGHT * 2)
+/* Boot / default frame (Kconfig-selected). */
+#define FRAME_BYTES      (THERMAL_WIDTH * THERMAL_HEIGHT * 2)
+/* Upper bound across every advertised frame — sizes the UVC transfer buffer
+ * and the nosignal buffer so a host committing the larger frame (or a
+ * RES,W,H switch) doesn't overrun them. */
+#define MAX_FRAME_BYTES  (THERMAL_MAX_WIDTH * THERMAL_MAX_HEIGHT * 2)
+
+/* Single-instance tracker so other modules (camera_uart RES handler) can ask
+ * whether a UVC host is currently pulling frames. */
+static uvc_stream_ctx_t *s_ctx;
+
+bool uvc_stream_is_active(void)
+{
+    return s_ctx && s_ctx->streaming;
+}
 
 /* ---- UVC callbacks ------------------------------------------------------ */
 
@@ -50,6 +65,9 @@ static esp_err_t on_stream_start(uvc_format_t uvc_format, int width, int height,
 
     /* Match the delivered frame size to what the host committed. */
     camera_set_resolution(&ctx->camera, ctx->width, ctx->height);
+    /* Also persist it so the web-only path (post-reboot, no host yet) comes
+     * back on the same resolution the last host was using. */
+    settings_set_resolution(ctx->width, ctx->height);
 
     esp_err_t ret = camera_start(&ctx->camera);
     if (ret != ESP_OK) {
@@ -142,18 +160,31 @@ static void on_fb_return(uvc_fb_t *fb, void *cb_ctx)
 esp_err_t uvc_stream_init(uvc_stream_ctx_t *ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
+    s_ctx = ctx;
 
     ESP_RETURN_ON_ERROR(camera_open(&ctx->camera), TAG, "camera_open failed");
 
+    /* Apply the last-used resolution BEFORE the host starts negotiating. Web-
+     * only sessions (no UVC host) inherit it directly; UVC sessions overwrite
+     * it in on_stream_start with whatever the host commits. */
+    uint32_t saved_w = 0, saved_h = 0;
+    if (settings_get_resolution(&saved_w, &saved_h) == ESP_OK) {
+        if (camera_set_resolution(&ctx->camera, saved_w, saved_h) == ESP_OK) {
+            ESP_LOGI(TAG, "restored saved resolution %ux%u",
+                     (unsigned)saved_w, (unsigned)saved_h);
+        }
+    }
+
     /* NO SIGNAL frame: 16×16-block checkerboard (0x0000 / 0x3FFF).
      * Host AGC will show full contrast so the pattern is unmistakable. */
-    ctx->nosignal_buf = heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ctx->nosignal_buf = heap_caps_malloc(MAX_FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_RETURN_ON_FALSE(ctx->nosignal_buf, ESP_ERR_NO_MEM, TAG,
-                        "nosignal buffer alloc failed (%d B)", FRAME_BYTES);
-    for (int y = 0; y < THERMAL_HEIGHT; y++) {
-        for (int x = 0; x < THERMAL_WIDTH; x++) {
+                        "nosignal buffer alloc failed (%d B)", MAX_FRAME_BYTES);
+    /* Fill at max dimensions so the pattern is intact at any advertised frame. */
+    for (int y = 0; y < THERMAL_MAX_HEIGHT; y++) {
+        for (int x = 0; x < THERMAL_MAX_WIDTH; x++) {
             int block = ((x >> 4) + (y >> 4)) & 1;
-            ctx->nosignal_buf[y * THERMAL_WIDTH + x] = block ? 0x3FFF : 0x0000;
+            ctx->nosignal_buf[y * THERMAL_MAX_WIDTH + x] = block ? 0x3FFF : 0x0000;
         }
     }
 
@@ -162,14 +193,14 @@ esp_err_t uvc_stream_init(uvc_stream_ctx_t *ctx)
      * this buffer before handing off to the USB DMA.  Must be large enough
      * for one full Y16 frame.
      */
-    void *uvc_buf = heap_caps_aligned_alloc(64, FRAME_BYTES,
+    void *uvc_buf = heap_caps_aligned_alloc(64, MAX_FRAME_BYTES,
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_RETURN_ON_FALSE(uvc_buf, ESP_ERR_NO_MEM, TAG,
-                        "UVC transfer buffer alloc failed (%d B)", FRAME_BYTES);
+                        "UVC transfer buffer alloc failed (%d B)", MAX_FRAME_BYTES);
 
     uvc_device_config_t uvc_cfg = {
         .uvc_buffer      = uvc_buf,
-        .uvc_buffer_size = FRAME_BYTES,
+        .uvc_buffer_size = MAX_FRAME_BYTES,
         .start_cb        = on_stream_start,
         .fb_get_cb       = on_fb_get,
         .fb_return_cb    = on_fb_return,
