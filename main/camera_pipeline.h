@@ -69,6 +69,7 @@ typedef struct {
     void          *bufs[DVP_BUFFER_COUNT]; /* DMA frame buffers in PSRAM */
     volatile uint8_t  state[DVP_BUFFER_COUNT];
     volatile uint32_t buf_seq[DVP_BUFFER_COUNT]; /* capture seq tag per buffer */
+    volatile uint32_t buf_recv[DVP_BUFFER_COUNT]; /* bytes actually DMA'd into this buffer */
     size_t         buf_size;               /* DMA capture size = w * cap_height * 2 */
     size_t         frame_size;             /* delivered Y16 frame = w * h * 2 */
     uint32_t       width;

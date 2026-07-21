@@ -98,6 +98,7 @@ static bool IRAM_ATTR camera_trans_finished_cb(esp_cam_ctlr_handle_t handle,
         if (ctx->bufs[i] == trans->buffer) {
             ctx->state[i] = BUF_READY;      /* publish the freshly filled one */
             ctx->buf_seq[i] = seq;
+            ctx->buf_recv[i] = trans->received_size;
             break;
         }
     }
@@ -500,6 +501,37 @@ const uint16_t *camera_get_frame(camera_ctx_t *ctx, void **out_buf,
             if (phase != ctx->keep_parity) {
                 portENTER_CRITICAL(&ctx->lock);
                 ctx->state[idx] = BUF_FREE;   /* wrong phase — drop, wait for the other */
+                portEXIT_CRITICAL(&ctx->lock);
+                idx = -1;
+                continue;
+            }
+        }
+        /*
+         * Line-alignment guard. The DMA writes samples linearly, so if the
+         * sensor drops a few PCLK samples inside a line (transient PCLK/HSYNC
+         * glitch) every byte after the drop lands one position too far left
+         * and the frame renders as sideways-shear until the next VSYNC resets.
+         * The observable tell is that received_size for the bad frame comes
+         * out SHORTER than the active image needs — the DMA never wrote the
+         * bytes we're about to hand to a consumer. Drop those.
+         * Frames where received_size is at least the active image AND is a
+         * whole-line multiple pass through untouched. Frames where it's a
+         * partial line beyond the active image also pass — the extra bytes
+         * are past frame_size and never read, and rejecting those would
+         * false-positive on the vblank-margin captures that are the normal
+         * healthy pattern here.
+         */
+        {
+            uint32_t recv = ctx->buf_recv[idx];
+            uint32_t line = ctx->width * 2u;
+            if (line && recv < ctx->frame_size) {
+                static uint32_t drop_count;
+                if ((drop_count++ % 25u) == 0) {
+                    ESP_LOGW(TAG, "shear-guard drop: recv=%"PRIu32" B < frame=%zu B (drops=%"PRIu32")",
+                             recv, ctx->frame_size, drop_count);
+                }
+                portENTER_CRITICAL(&ctx->lock);
+                ctx->state[idx] = BUF_FREE;
                 portEXIT_CRITICAL(&ctx->lock);
                 idx = -1;
                 continue;
