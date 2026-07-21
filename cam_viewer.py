@@ -208,15 +208,31 @@ ACCENT = "#4da3ff"
 
 
 def open_camera(index, w, h):
-    cap = cv2.VideoCapture(index + cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap.release()
+    """Open the UVC device and select the Y16 frame of the requested size.
+
+    Every call here is wrapped: the DirectShow backend raises a bare
+    "Unknown C++ exception from OpenCV code" — not a return code — when the
+    device is mid-re-enumeration, which is exactly the state a resolution
+    switch puts it in. Uncaught, that killed the capture thread outright and
+    the viewer went dead until restarted."""
+    cap = None
+    try:
+        cap = cv2.VideoCapture(index + cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc('Y', '1', '6', ' '))
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)     # selects the matching UVC frame
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        return cap
+    except Exception:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
         return None
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc('Y', '1', '6', ' '))
-    cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)     # selects the matching UVC frame
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-    return cap
 
 
 class CameraThread(threading.Thread):
@@ -264,7 +280,12 @@ class CameraThread(threading.Thread):
                 session_start = time.time()
                 got_frame = False
 
-            ret, raw = cap.read()
+            try:
+                ret, raw = cap.read()
+            except Exception:
+                # Same DirectShow failure mode as open_camera: drop the handle
+                # and let the reopen path below deal with it.
+                ret, raw = False, None
             buf = None if raw is None else np.frombuffer(raw, dtype='<u2')
             now = time.time()
             npix = self.w * self.h
@@ -885,8 +906,17 @@ class Viewer(tk.Tk):
         return RESOLUTIONS[0][1], RESOLUTIONS[0][2]
 
     def _restart_cam(self, w, h):
+        # stop() only sets a flag — the old thread still holds the device open
+        # until it falls out of its read and releases. Starting the new thread
+        # immediately had both racing for the same handle, and DirectShow
+        # answers that race by throwing. Wait for the old one to let go.
+        old = self.cam
         try:
-            self.cam.stop()
+            old.stop()
+        except Exception:
+            pass
+        try:
+            old.join(timeout=3.0)
         except Exception:
             pass
         self.cam = CameraThread(DEVICE_INDEX, w, h)
