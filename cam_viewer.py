@@ -360,8 +360,12 @@ class SerialConsole:
         last = s.rfind(",")
         if last >= 3:
             tail = s[last + 1:]
-            # Checksum/ETX tail: short, or contains control/replacement chars.
-            if len(tail) <= 3 or re.search(r"[\x00-\x1f\x7f�]", tail):
+            # Framing bytes come through as '.' (RX task replaces non-printables)
+            # or as literal control/replacement chars. A short tail without any
+            # of those markers is a REAL value (RES,640,480 → tail "480") and
+            # must not be stripped — the previous len(tail)<=3 heuristic ate
+            # 3-digit resolutions and broke the web-issued RES round-trip.
+            if len(tail) <= 3 and ("." in tail or re.search(r"[\x00-\x1f\x7f�]", tail)):
                 s = s[:last]
         return s.rstrip(",")
 
@@ -717,6 +721,10 @@ class Viewer(tk.Tk):
             self._want_serial = True
             self._connect_btn.configure(text="Disconnect")
             self._append_return(f"— auto-connected {bridge} —")
+            # Ask the P4 what resolution it's actually on so we adopt that
+            # instead of opening UVC at our own combo default and clobbering
+            # the persisted resolution back to it.
+            self.after(300, lambda: self.serial.send("RES"))
         except Exception:
             self.after(2000, self._auto_connect)
 
@@ -735,6 +743,7 @@ class Viewer(tk.Tk):
             self._want_serial = True
             self._connect_btn.configure(text="Disconnect")
             self._append_return(f"— connected {port} —")
+            self.after(300, lambda: self.serial.send("RES"))
         except Exception as e:
             self._flash(f"open failed: {e}")
 

@@ -302,6 +302,19 @@ esp_err_t camera_uart_submit_line(const char *line)
      * Supported pairs mirror what the UVC descriptor advertises.
      */
     if (strcmp(cmd, "RES") == 0) {
+        /* Bare "RES" (no value) is a QUERY — emit the current delivered
+         * resolution so the py viewer can adopt what the P4 is actually on
+         * before it commits UVC (otherwise it opens at its own combo default
+         * and clobbers the persisted resolution back to that on every launch). */
+        if (val[0] == 0) {
+            if (s_cam) {
+                char msg[32];
+                snprintf(msg, sizeof(msg), "RES,%u,%u",
+                         (unsigned)s_cam->width, (unsigned)s_cam->height);
+                cdc_line(msg); log_append(msg);
+            }
+            return ESP_OK;
+        }
         int w = 0, h = 0;
         if (sscanf(val, "%d,%d", &w, &h) != 2) {
             const char *msg = "RES: expected RES,W,H";
