@@ -33,6 +33,7 @@
 #include <inttypes.h>
 
 #include "web_stream.h"
+#include "camera_uart.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -44,6 +45,14 @@
 #include "esp_heap_caps.h"
 #include "driver/jpeg_encode.h"
 
+/* LWIP socket options for the stream socket — TCP_NODELAY in particular is
+ * the single biggest anti-stutter change over Wi-Fi: without it the multipart
+ * header goes out, then Nagle waits for an ACK before releasing the JPEG
+ * body, so every frame eats one round-trip of Wi-Fi jitter as visible pause.
+ * lwip/sockets.h provides TCP_NODELAY, IPPROTO_TCP, SO_SNDTIMEO, setsockopt,
+ * and struct timeval; nothing else is needed. */
+#include "lwip/sockets.h"
+
 static const char *TAG = "web_stream";
 
 /* Buffers are sized once for the largest frame the pipeline can deliver, so a
@@ -54,6 +63,21 @@ static const char *TAG = "web_stream";
 
 #define WEB_JPEG_QUALITY 80
 #define WEB_FRAME_TIMEOUT_MS 500
+
+/*
+ * Tap probe timeout — how long capture_jpeg() waits on the observer tap before
+ * concluding that nothing else is consuming frames and going to the direct
+ * capture path. Must be a comfortable multiple of the ~40 ms phase period so a
+ * live UVC session's tap signal never times out spuriously; must also be short
+ * enough that with NO consumer, the ~5 consecutive misses it takes to switch
+ * to direct mode don't wreck the delivered fps. 120 ms hits both.
+ *
+ * WEB_FRAME_TIMEOUT_MS above (500 ms) is still used by the direct-capture
+ * fallback and by the stream_task's "no frames" break condition.
+ */
+#define WEB_TAP_PROBE_MS  120
+#define WEB_TAP_SKIP_AFTER 5   /* after N consecutive misses, skip the tap entirely */
+#define WEB_TAP_RETRY_EVERY 25 /* one probe per ~1 s to detect UVC coming online */
 
 /* Multipart/x-mixed-replace: the format every browser renders natively as a
  * live <img>, with no JavaScript and no MSE. */
@@ -150,18 +174,47 @@ static uint32_t capture_jpeg(void)
 {
     camera_ctx_t *cam = s_web.cam;
     uint32_t w = 0, h = 0;
+    bool got = false;
 
     /*
-     * Preferred path: take a copy of whatever the primary consumer is already
-     * pulling. Claiming a buffer ourselves does not work while UVC is
-     * streaming - it runs at priority 23 against this task's 5 and wins every
-     * publish, which showed up as a stream that produced exactly zero frames.
+     * Adaptive path selection:
+     *
+     *   With UVC active — a primary consumer signals the tap ~25 times/s, so
+     *   camera_tap_get() returns almost immediately. Any direct claim here
+     *   would lose the buffer race against the UVC task (prio 23 vs our 5)
+     *   and deliver zero frames — see the tap rationale in camera_pipeline.c.
+     *
+     *   With NO UVC — nothing ever signals the tap, so a plain 500 ms wait
+     *   here caps output at ~2 fps. Instead: probe the tap briefly, and after
+     *   a few consecutive misses assume nothing's consuming and switch to a
+     *   direct claim (which is uncontended in that case, by definition).
+     *
+     * Every WEB_TAP_RETRY_EVERY frames we probe once more so a UVC session
+     * that starts mid-stream is picked up within ~1 s.
      */
-    if (!camera_tap_get(cam, s_web.y16, (size_t)WEB_MAX_PIXELS * 2, &w, &h,
-                        WEB_FRAME_TIMEOUT_MS)) {
-        /* Nothing is consuming frames (no USB host attached), so the tap will
-         * never fill. With no competing consumer we can safely claim a buffer
-         * directly - this is the uncontended case by definition. */
+    static uint32_t s_tap_misses;
+    static uint32_t s_frame_seq;
+    s_frame_seq++;
+
+    bool try_tap = (s_tap_misses < WEB_TAP_SKIP_AFTER) ||
+                   ((s_frame_seq % WEB_TAP_RETRY_EVERY) == 0);
+
+    if (try_tap) {
+        if (camera_tap_get(cam, s_web.y16, (size_t)WEB_MAX_PIXELS * 2, &w, &h,
+                           WEB_TAP_PROBE_MS)) {
+            got = true;
+            s_tap_misses = 0;
+        } else if (s_tap_misses < 0xFF) {
+            s_tap_misses++;
+        }
+    }
+
+    if (!got) {
+        /* Direct capture path — the uncontended case (no other consumer, or
+         * we're mid-probe-window). If UVC IS running and we happen to hit this
+         * branch on a retry, the priority difference makes camera_get_frame
+         * usually time out cleanly and we return 0 for this iteration; the
+         * next tap_get succeeds and we're back on the shared path. */
         void *hold = NULL;
         const uint16_t *raw = camera_get_frame(cam, &hold, WEB_FRAME_TIMEOUT_MS);
         if (!raw) {
@@ -289,47 +342,341 @@ static esp_err_t stats_handler(httpd_req_t *req)
 
 static esp_err_t index_handler(httpd_req_t *req)
 {
+    /*
+     * Single-page viewer. Rendering pipeline in the browser:
+     *
+     *   <img src="/stream" hidden>  --drawImage-->  <canvas>
+     *   <canvas>  --getImageData -> LUT -> putImageData-->  visible frame
+     *
+     * The MJPEG server ships an 8-bit grey JPEG (see agc_y16_to_gray) and the
+     * canvas re-colours it with one of a few 256-entry palettes plus an
+     * optional inversion. Grayscale-no-invert is fast-pathed to just display
+     * the img directly, so on that default the browser does zero pixel work.
+     *
+     * The MJPEG socket stays open forever, so polls here are deliberately slow
+     * (500 ms for /log, 1 s for /stats): httpd has only a handful of sockets
+     * and a fast poll can starve the stream that is reporting on it.
+     */
     static const char page[] =
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>P4 Thermal</title>"
-        "<style>body{margin:0;background:#111;color:#ccc;font:14px system-ui;"
-        "display:flex;flex-direction:column;align-items:center;gap:8px;padding:12px}"
-        "img{width:min(96vw,768px);image-rendering:pixelated;border:1px solid #333}"
-        "#s{display:grid;grid-template-columns:auto 1fr auto;gap:4px 10px;"
-        "width:min(96vw,768px);font:12px ui-monospace,monospace}"
-        ".b{background:#222;border-radius:3px;overflow:hidden;height:14px}"
-        ".f{height:100%;background:#ffa34d;width:0;transition:width .3s}"
-        ".v{text-align:right;color:#eee;white-space:nowrap}</style>"
-        "<h3>ESP32-P4 thermal (MJPEG, 8-bit AGC)</h3>"
-        "<img src='/stream'>"
-        "<div id=s>"
-        "<span>CPU0</span><div class=b><div class=f id=c0></div></div><span class=v id=c0v>-</span>"
-        "<span>CPU1</span><div class=b><div class=f id=c1></div></div><span class=v id=c1v>-</span>"
-        "<span>Internal</span><div class=b><div class=f id=ib></div></div><span class=v id=iv>-</span>"
-        "<span>PSRAM</span><div class=b><div class=f id=pb></div></div><span class=v id=pv>-</span>"
-        "<span>Stream</span><div></div><span class=v id=fv>-</span>"
-        "</div>"
-        "<p>Raw 14-bit data is on the USB UVC stream, not here.</p>"
-        "<script>"
-        "const kb=b=>b>1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(0)+' kB';"
-        "function set(bar,val,pct,txt){document.getElementById(bar).style.width=pct+'%';"
-        "document.getElementById(val).textContent=txt;}"
-        "async function u(){try{const r=await fetch('/stats');const d=await r.json();"
-        "set('c0','c0v',d.cpu0,d.cpu0.toFixed(0)+'%');"
-        "set('c1','c1v',d.cpu1,d.cpu1.toFixed(0)+'%');"
-        "const iu=d.int_total-d.int_free,pu=d.psram_total-d.psram_free;"
-        "set('ib','iv',100*iu/d.int_total,kb(iu)+' / '+kb(d.int_total)+'  (min free '+kb(d.int_min)+')');"
-        "set('pb','pv',100*pu/d.psram_total,kb(pu)+' / '+kb(d.psram_total)+'  (min free '+kb(d.psram_min)+')');"
-        "document.getElementById('fv').textContent=d.fps.toFixed(1)+' fps   up '+d.uptime+'s';"
-        "}catch(e){}}"
-        /* The MJPEG stream holds one socket open for its whole life, so polling
-           must be gentle: httpd only has a handful of sockets and a fast poll
-           starves the very stream we are reporting on. */
-        "setInterval(u,1000);u();"
-        "</script>";
+"<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+"<title>P4 Thermal</title>"
+"<style>"
+"body{margin:0;background:#111;color:#ccc;font:14px system-ui;"
+"display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px}"
+"h3{margin:0}"
+/* No hidden <img> here — even at opacity 0 or off-screen, Chrome/Firefox
+   throttle the multipart decode and drawImage keeps returning frame #1.
+   The stream is consumed via fetch()+ReadableStream in JS and each JPEG is
+   turned into an ImageBitmap manually; see drawStream() below. */
+"#viewwrap{width:min(96vw,768px);border:1px solid #333;line-height:0}"
+"#view{width:100%;image-rendering:pixelated;display:block}"
+".row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;"
+"width:min(96vw,768px);font:12px ui-monospace,monospace}"
+".row label{display:flex;gap:4px;align-items:center}"
+"select,input,button{background:#1a1a1a;color:#eee;border:1px solid #333;"
+"padding:4px 6px;font:12px ui-monospace,monospace;border-radius:3px}"
+"button{cursor:pointer}"
+"button:hover{background:#242424}"
+"#cmdform{display:flex;gap:6px;width:100%}"
+"#cmd{flex:1}"
+"#log{width:min(96vw,768px);height:180px;overflow-y:auto;background:#0a0a0a;"
+"border:1px solid #222;padding:6px 8px;font:12px ui-monospace,monospace;"
+"color:#9adf9a;border-radius:3px;white-space:pre-wrap;box-sizing:border-box}"
+"#log .tx{color:#ffa34d}"
+"#log .sys{color:#7ac8ff}"
+"#s{display:grid;grid-template-columns:auto 1fr auto;gap:4px 10px;"
+"width:min(96vw,768px);font:12px ui-monospace,monospace}"
+".b{background:#222;border-radius:3px;overflow:hidden;height:14px}"
+".f{height:100%;background:#ffa34d;width:0;transition:width .3s}"
+".v{text-align:right;color:#eee;white-space:nowrap}"
+"details{width:min(96vw,768px)}"
+"summary{cursor:pointer;padding:4px 0;color:#eee}"
+"</style>"
+
+"<h3>ESP32-P4 thermal</h3>"
+
+"<div id=viewwrap>"
+"<canvas id=view width=384 height=288></canvas>"
+"</div>"
+
+"<div class=row>"
+"<label>Palette "
+"<select id=pal>"
+"<option value=grayscale>Grayscale</option>"
+"<option value=iron>Iron</option>"
+"<option value=ironbow>Ironbow</option>"
+"<option value=rainbow>Rainbow</option>"
+"<option value=hot>Hot</option>"
+"<option value=cool>Cool</option>"
+"</select></label>"
+"<label><input type=checkbox id=inv> Invert</label>"
+"<span id=fv style='margin-left:auto'>-</span>"
+"</div>"
+
+"<details open><summary>Camera console</summary>"
+"<form id=cmdform autocomplete=off>"
+"<input id=cmd placeholder='CMD or CMD,VAL  (e.g. GCO, KBD,C, SSM,1, BIT,8)' spellcheck=false>"
+"<button type=submit>Send</button>"
+"</form>"
+"<div id=log></div>"
+"<div style='font:11px ui-monospace,monospace;color:#888;margin-top:4px'>"
+"BIT/PCK are handled on the P4; anything else is forwarded to the camera UART."
+"</div>"
+"</details>"
+
+"<details><summary>System stats</summary>"
+"<div id=s>"
+"<span>CPU0</span><div class=b><div class=f id=c0></div></div><span class=v id=c0v>-</span>"
+"<span>CPU1</span><div class=b><div class=f id=c1></div></div><span class=v id=c1v>-</span>"
+"<span>Internal</span><div class=b><div class=f id=ib></div></div><span class=v id=iv>-</span>"
+"<span>PSRAM</span><div class=b><div class=f id=pb></div></div><span class=v id=pv>-</span>"
+"<span>Uptime</span><div></div><span class=v id=upv>-</span>"
+"</div>"
+"</details>"
+
+"<p style='font-size:12px;color:#888'>"
+"Raw 14-bit thermal is on the USB UVC stream; this view is the 8-bit AGC preview.</p>"
+
+"<script>"
+/* ---------- Palettes: piecewise linear over control points in [0,1]. -------- */
+"const PAL={"
+"grayscale:[[0,0,0,0],[1,255,255,255]],"
+"iron:[[0,0,0,0],[.15,17,7,73],[.35,168,17,84],[.55,240,84,32],[.8,247,206,29],[1,255,255,240]],"
+"ironbow:[[0,0,0,0],[.15,50,0,100],[.35,150,0,60],[.55,240,80,20],[.8,255,220,60],[1,255,255,240]],"
+"rainbow:[[0,80,0,150],[.2,0,80,220],[.4,0,200,180],[.6,120,240,60],[.8,240,200,20],[1,240,50,20]],"
+"hot:[[0,0,0,0],[.33,180,0,0],[.66,255,140,0],[1,255,255,150]],"
+"cool:[[0,20,180,240],[1,240,60,180]]"
+"};"
+"function buildLut(stops,invert){"
+"const out=new Uint8ClampedArray(768);"
+"for(let i=0;i<256;i++){"
+"const t=invert?1-i/255:i/255;"
+"let a=stops[0],b=stops[stops.length-1];"
+"for(let k=0;k<stops.length-1;k++){"
+"if(t>=stops[k][0]&&t<=stops[k+1][0]){a=stops[k];b=stops[k+1];break;}"
+"}"
+"const f=(b[0]===a[0])?0:(t-a[0])/(b[0]-a[0]);"
+"out[i*3]=a[1]+f*(b[1]-a[1]);"
+"out[i*3+1]=a[2]+f*(b[2]-a[2]);"
+"out[i*3+2]=a[3]+f*(b[3]-a[3]);"
+"}"
+"return out;"
+"}"
+
+/* ---------- Render: consume /stream directly via fetch() ------------------ */
+/* Using an <img src=/stream> and drawImage() does not work: at opacity 0,
+   display:none, or off-screen, Chromium/Firefox throttle the multipart
+   decoder and drawImage returns the same first frame forever while the fps
+   counter (which just counts JPEGs the server sends) keeps climbing.
+   Fetching /stream ourselves and parsing the multipart boundaries in JS
+   bypasses that entirely and pins the decode to the tab's lifetime. */
+"const cvs=document.getElementById('view');"
+"const cctx=cvs.getContext('2d',{willReadFrequently:true});"
+"let curName='grayscale',invert=false;"
+"let curLut=buildLut(PAL[curName],invert);"
+"document.getElementById('pal').addEventListener('change',e=>{"
+"curName=e.target.value;curLut=buildLut(PAL[curName],invert);"
+"});"
+"document.getElementById('inv').addEventListener('change',e=>{"
+"invert=e.target.checked;curLut=buildLut(PAL[curName],invert);"
+"});"
+"function drawFrame(bmp){"
+"if(cvs.width!==bmp.width||cvs.height!==bmp.height){"
+"cvs.width=bmp.width;cvs.height=bmp.height;"
+"}"
+"cctx.drawImage(bmp,0,0);"
+/* Fast path: grayscale + no invert = the raw JPEG already IS what we want. */
+"if(curName!=='grayscale'||invert){"
+"const img=cctx.getImageData(0,0,cvs.width,cvs.height);"
+"const d=img.data,lut=curLut;"
+"for(let i=0;i<d.length;i+=4){"
+"const g=d[i];"
+"d[i]=lut[g*3];d[i+1]=lut[g*3+1];d[i+2]=lut[g*3+2];"
+"}"
+"cctx.putImageData(img,0,0);"
+"}"
+"}"
+/* Boundary matches the server side (BOUNDARY macro in web_stream.c). */
+"const BND=new TextEncoder().encode('\\r\\n--thermalframe\\r\\n');"
+"const HDR_END=new TextEncoder().encode('\\r\\n\\r\\n');"
+"function findSeq(hay,needle,from){"
+"outer:for(let i=from;i<=hay.length-needle.length;i++){"
+"for(let j=0;j<needle.length;j++)if(hay[i+j]!==needle[j])continue outer;"
+"return i;"
+"}"
+"return -1;"
+"}"
+"function concat(a,b){"
+"const c=new Uint8Array(a.length+b.length);"
+"c.set(a);c.set(b,a.length);return c;"
+"}"
+"async function drawStream(){"
+"const resp=await fetch('/stream',{cache:'no-store'});"
+"if(!resp.body)throw new Error('no stream body');"
+"const reader=resp.body.getReader();"
+"const td=new TextDecoder();"
+"let buf=new Uint8Array(0);"
+"while(true){"
+"const {value,done}=await reader.read();"
+"if(done)break;"
+"buf=concat(buf,value);"
+"for(;;){"
+"const b0=findSeq(buf,BND,0);"
+"if(b0<0)break;"
+"const hs=b0+BND.length;"
+"const he=findSeq(buf,HDR_END,hs);"
+"if(he<0)break;"
+"const headers=td.decode(buf.subarray(hs,he));"
+"const m=headers.match(/Content-Length:\\s*(\\d+)/i);"
+"if(!m){buf=buf.subarray(he+4);continue;}"
+"const len=+m[1];"
+"const bs=he+4,be=bs+len;"
+"if(buf.length<be)break;"
+"const jpeg=buf.slice(bs,be);"
+"buf=buf.subarray(be);"
+"try{"
+"const bmp=await createImageBitmap(new Blob([jpeg],{type:'image/jpeg'}));"
+"drawFrame(bmp);bmp.close();"
+"}catch(e){}"
+"}"
+/* Keep the working buffer from growing unbounded on partial matches (shouldn't
+   happen with a healthy stream, but be safe). */
+"if(buf.length>200000)buf=buf.slice(-100000);"
+"}"
+"}"
+"(async function loop(){"
+"while(true){"
+"try{await drawStream();}catch(e){}"
+"await new Promise(r=>setTimeout(r,500));"
+"}"
+"})();"
+
+/* ---------- Camera console ------------------------------------------------ */
+"let logSeq=0;"
+"const logEl=document.getElementById('log');"
+"function addLog(text){"
+"const d=document.createElement('div');"
+"if(text.startsWith('TX ->'))d.className='tx';"
+"else if(text.startsWith('BIT')||text.startsWith('PCK'))d.className='sys';"
+"d.textContent=text;"
+"logEl.appendChild(d);"
+"while(logEl.childElementCount>200)logEl.removeChild(logEl.firstChild);"
+"logEl.scrollTop=logEl.scrollHeight;"
+"}"
+"async function pollLog(){"
+"try{"
+"const r=await fetch('/log?since='+logSeq);"
+"const j=await r.json();"
+"if(j.lines)for(const l of j.lines)addLog(l);"
+"if(j.seq)logSeq=j.seq;"
+"}catch(e){}"
+"}"
+"setInterval(pollLog,500);pollLog();"
+"async function sendCmd(text){"
+"if(!text)return;"
+"try{await fetch('/cmd?c='+encodeURIComponent(text));}catch(e){}"
+"pollLog();"
+"}"
+"document.getElementById('cmdform').addEventListener('submit',e=>{"
+"e.preventDefault();"
+"const inp=document.getElementById('cmd');"
+"sendCmd(inp.value);inp.value='';"
+"});"
+
+/* ---------- Stats poll ---------------------------------------------------- */
+"const kb=b=>b>1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(0)+' kB';"
+"function set(bar,val,pct,txt){document.getElementById(bar).style.width=pct+'%';"
+"document.getElementById(val).textContent=txt;}"
+"async function updateStats(){try{const r=await fetch('/stats');const d=await r.json();"
+"set('c0','c0v',d.cpu0,d.cpu0.toFixed(0)+'%');"
+"set('c1','c1v',d.cpu1,d.cpu1.toFixed(0)+'%');"
+"const iu=d.int_total-d.int_free,pu=d.psram_total-d.psram_free;"
+"set('ib','iv',100*iu/d.int_total,kb(iu)+' / '+kb(d.int_total)+'  (min free '+kb(d.int_min)+')');"
+"set('pb','pv',100*pu/d.psram_total,kb(pu)+' / '+kb(d.psram_total)+'  (min free '+kb(d.psram_min)+')');"
+"document.getElementById('upv').textContent=d.uptime+' s';"
+"document.getElementById('fv').textContent=d.fps.toFixed(1)+' fps';"
+"}catch(e){}}"
+"setInterval(updateStats,1000);updateStats();"
+"</script>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
 }
+
+/* ---------------------------------------------------------- UART bridge */
+
+/* URL-decode `src` in place into `dst` (dst may equal src). Truncates at
+ * cap-1 bytes and NUL-terminates. */
+static void url_decode(const char *src, char *dst, size_t cap)
+{
+    size_t o = 0;
+    for (const char *p = src; *p && o + 1 < cap; ) {
+        if (*p == '+') { dst[o++] = ' '; p++; continue; }
+        if (*p == '%' && p[1] && p[2]) {
+            char h[3] = { p[1], p[2], 0 };
+            char *end = NULL;
+            unsigned v = (unsigned)strtoul(h, &end, 16);
+            if (end == h + 2) {
+                dst[o++] = (char)v;
+                p += 3;
+                continue;
+            }
+        }
+        dst[o++] = *p++;
+    }
+    dst[o] = '\0';
+}
+
+/* GET /cmd?c=<CMD[,VAL]>  — forward a command to the camera. Reuses the same
+ * parser the CDC console uses, so BIT/PCK still work locally. */
+static esp_err_t cmd_handler(httpd_req_t *req)
+{
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing ?c=<command>");
+    }
+    char raw[80];
+    if (httpd_query_key_value(query, "c", raw, sizeof(raw)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing ?c=<command>");
+    }
+    char line[80];
+    url_decode(raw, line, sizeof(line));
+
+    esp_err_t err = camera_uart_submit_line(line);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char body[64];
+    int n = snprintf(body, sizeof(body), "{\"ok\":%s,\"err\":%d}",
+                     err == ESP_OK ? "true" : "false", (int)err);
+    return httpd_resp_send(req, body, n);
+}
+
+/* GET /log?since=<seq>  — poll for new UART log lines. */
+static esp_err_t log_handler(httpd_req_t *req)
+{
+    uint32_t since = 0;
+    char query[64];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char s[16];
+        if (httpd_query_key_value(query, "since", s, sizeof(s)) == ESP_OK) {
+            since = (uint32_t)strtoul(s, NULL, 10);
+        }
+    }
+    /* Size the buffer generously: 32 lines * up to ~2 chars/byte after JSON
+     * escaping + quotes/commas ~= 8 KB max. */
+    static char buf[8192];
+    size_t len = camera_uart_log_snapshot(since, buf, sizeof(buf));
+    if (len == 0) {
+        strcpy(buf, "{\"seq\":0,\"lines\":[]}");
+        len = strlen(buf);
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, buf, len);
+}
+
+/* --------------------------------------------------------------- routes */
 
 static esp_err_t snapshot_handler(httpd_req_t *req)
 {
@@ -367,6 +714,28 @@ static void stream_task(void *arg)
      * guaranteed to come across. */
     httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    /*
+     * Anti-stutter socket tuning for the streaming client.
+     *
+     *   TCP_NODELAY: httpd_resp_send_chunk() sends the multipart header and the
+     *     JPEG body as two separate calls. With Nagle on, the second send is
+     *     coalesced/delayed until the first is ACKed — under Wi-Fi jitter that
+     *     turns into a ~40 ms wait per frame that reads as a hitch even with
+     *     good RSSI. Nodelay removes it.
+     *
+     *   SO_SNDTIMEO: a browser that closes its tab but leaves the TCP FIN
+     *     unread (or a Wi-Fi stall of many seconds) would otherwise block the
+     *     stream task inside send() forever, holding the buffers and the
+     *     client_busy flag. A ~5 s cap turns those into a clean disconnect.
+     */
+    int fd = httpd_req_to_sockfd(req);
+    if (fd >= 0) {
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
 
     ESP_LOGI(TAG, "stream client connected");
 
@@ -514,6 +883,8 @@ esp_err_t web_stream_start(camera_ctx_t *cam)
         { .uri = "/stream",   .method = HTTP_GET, .handler = stream_handler   },
         { .uri = "/snapshot", .method = HTTP_GET, .handler = snapshot_handler },
         { .uri = "/stats",    .method = HTTP_GET, .handler = stats_handler    },
+        { .uri = "/cmd",      .method = HTTP_GET, .handler = cmd_handler      },
+        { .uri = "/log",      .method = HTTP_GET, .handler = log_handler      },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &routes[i]), TAG,

@@ -8,9 +8,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <inttypes.h>
 #include "camera_uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "tusb.h"   /* CDC-ACM: the command console rides the composite USB device */
@@ -28,6 +30,23 @@ static const char *TAG = "cam_uart";
 
 static camera_ctx_t *s_cam;   /* for the local BIT (8/14-bit phase) command */
 
+/*
+ * Log ring: recent lines the web /log endpoint pulls to show TX confirmations
+ * and RX replies in the browser console. Small on purpose — a monotonic seq
+ * lets clients poll ?since=<seq> and get only new lines. Size (32 x 128) fits
+ * easily in internal RAM and is enough to survive a slow poller (~15 s worth
+ * at the highest realistic reply rate).
+ */
+#define LOG_MAX_LINES  32
+#define LOG_MAX_CHARS  128
+
+static struct {
+    SemaphoreHandle_t mtx;
+    uint32_t seq_next;               /* seq assigned to the most recent line */
+    char     text[LOG_MAX_LINES][LOG_MAX_CHARS];
+    uint32_t seq[LOG_MAX_LINES];     /* 0 = slot empty */
+} s_log;
+
 /* Write a line to the CDC COM port (if a host terminal is attached). Lines
  * are prefixed "cam_uart:" so the viewer's reply filter matches both the CDC
  * port and the log console. */
@@ -40,6 +59,100 @@ static void cdc_line(const char *text)
     tud_cdc_write_str(text);
     tud_cdc_write_str("\r\n");
     tud_cdc_write_flush();
+}
+
+/* Append a line to the log ring. Sinks (RX, TX confirm, local replies) all
+ * funnel through here so the browser sees exactly the same stream as the CDC
+ * console and the ESP-IDF log. */
+static void log_append(const char *text)
+{
+    if (!s_log.mtx || !text) {
+        return;
+    }
+    xSemaphoreTake(s_log.mtx, portMAX_DELAY);
+    uint32_t seq = ++s_log.seq_next;
+    if (seq == 0) seq = ++s_log.seq_next;   /* skip 0 — reserved for "empty" */
+    int slot = (int)(seq % LOG_MAX_LINES);
+    s_log.seq[slot] = seq;
+    /* Strip trailing CR/LF; the ring stores one plain line per slot. */
+    size_t n = strlen(text);
+    while (n && (text[n - 1] == '\r' || text[n - 1] == '\n')) n--;
+    if (n >= LOG_MAX_CHARS) n = LOG_MAX_CHARS - 1;
+    memcpy(s_log.text[slot], text, n);
+    s_log.text[slot][n] = '\0';
+    xSemaphoreGive(s_log.mtx);
+}
+
+/* Escape one string for JSON output. Enough for the ASCII/printable-with-dots
+ * lines this module actually produces — quote and backslash are the only
+ * characters that can occur in practice that need escaping. */
+static size_t json_escape(const char *src, char *dst, size_t cap)
+{
+    size_t o = 0;
+    for (const char *p = src; *p && o + 2 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') {
+            if (o + 2 >= cap) break;
+            dst[o++] = '\\';
+            dst[o++] = (char)c;
+        } else if (c < 0x20) {
+            if (o + 6 >= cap) break;
+            o += (size_t)snprintf(dst + o, cap - o, "\\u%04x", c);
+        } else {
+            dst[o++] = (char)c;
+        }
+    }
+    dst[o] = '\0';
+    return o;
+}
+
+size_t camera_uart_log_snapshot(uint32_t since, char *dst, size_t cap)
+{
+    if (!dst || cap < 32) {
+        return 0;
+    }
+    if (!s_log.mtx) {
+        int n = snprintf(dst, cap, "{\"seq\":0,\"lines\":[]}");
+        return (n > 0) ? (size_t)n : 0;
+    }
+
+    xSemaphoreTake(s_log.mtx, portMAX_DELAY);
+    uint32_t seq_now = s_log.seq_next;
+
+    /* Nothing new — cheap early-out matches the common polling case. */
+    if (since >= seq_now) {
+        xSemaphoreGive(s_log.mtx);
+        int n = snprintf(dst, cap, "{\"seq\":%" PRIu32 ",\"lines\":[]}", seq_now);
+        return (n > 0) ? (size_t)n : 0;
+    }
+
+    /* Walk oldest -> newest by seq so the client can just append. Older entries
+     * outside the ring are silently skipped (they've fallen off). */
+    uint32_t start = (seq_now > LOG_MAX_LINES) ? (seq_now - LOG_MAX_LINES + 1) : 1;
+    if (start <= since) start = since + 1;
+
+    size_t o = 0;
+    int n = snprintf(dst + o, cap - o, "{\"seq\":%" PRIu32 ",\"lines\":[", seq_now);
+    if (n < 0 || (size_t)n >= cap - o) { xSemaphoreGive(s_log.mtx); dst[0] = '\0'; return 0; }
+    o += (size_t)n;
+
+    bool first = true;
+    for (uint32_t s = start; s <= seq_now; s++) {
+        int slot = (int)(s % LOG_MAX_LINES);
+        if (s_log.seq[slot] != s) continue;   /* stale/empty slot */
+
+        char esc[LOG_MAX_CHARS * 2];
+        json_escape(s_log.text[slot], esc, sizeof(esc));
+        n = snprintf(dst + o, cap - o, "%s\"%s\"", first ? "" : ",", esc);
+        if (n < 0 || (size_t)n >= cap - o) break;
+        o += (size_t)n;
+        first = false;
+    }
+    xSemaphoreGive(s_log.mtx);
+
+    n = snprintf(dst + o, cap - o, "]}");
+    if (n > 0 && (size_t)n < cap - o) o += (size_t)n;
+    return o;
 }
 
 esp_err_t camera_uart_send(const char *cmd, const char *values)
@@ -80,6 +193,11 @@ esp_err_t camera_uart_send(const char *cmd, const char *values)
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "TX -> %s", payload);
+
+    /* Also log the TX so the web console can echo what was sent. */
+    char echo[MAX_PAYLOAD + 8];
+    snprintf(echo, sizeof(echo), "TX -> %s", payload);
+    log_append(echo);
     return ESP_OK;
 }
 
@@ -102,7 +220,78 @@ static void rx_task(void *arg)
         asc[ao] = '\0';
         ESP_LOGI(TAG, "RX <- %d bytes | \"%s\" | %s", len, asc, hex);
         cdc_line(asc);   /* forward the reply to the CDC COM port */
+        log_append(asc); /* and to the web log ring */
     }
+}
+
+esp_err_t camera_uart_submit_line(const char *line)
+{
+    if (!line) return ESP_ERR_INVALID_ARG;
+
+    /* Split into "CMD" and "value" at the first comma; strip spaces. */
+    char cmd[8] = {0}, val[40] = {0};
+    const char *comma = strchr(line, ',');
+    const char *cs = line;
+    int ci = 0;
+    while (*cs && cs != comma && ci < (int)sizeof(cmd) - 1) {
+        if (!isspace((unsigned char)*cs)) cmd[ci++] = (char)toupper((unsigned char)*cs);
+        cs++;
+    }
+    if (comma) {
+        const char *vs = comma + 1;
+        int vi = 0;
+        while (*vs && vi < (int)sizeof(val) - 1) {
+            if (!isspace((unsigned char)*vs)) val[vi++] = (char)toupper((unsigned char)*vs);
+            vs++;
+        }
+    }
+    if (!cmd[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* "BIT" is a LOCAL command (not sent to the camera): switch which
+     * interleaved phase is delivered. BIT,8 = 8-bit video (menu),
+     * BIT,14 = 14-bit thermal, BIT alone = toggle. */
+    if (strcmp(cmd, "BIT") == 0) {
+        if (!s_cam) {
+            ESP_LOGW(TAG, "BIT: no camera context");
+            cdc_line("BIT: no camera context");
+            log_append("BIT: no camera context");
+            return ESP_ERR_INVALID_STATE;
+        }
+        uint32_t keep;
+        if (strcmp(val, "8") == 0)        keep = 0;
+        else if (strcmp(val, "14") == 0)  keep = 1;
+        else                              keep = s_cam->keep_parity ? 0u : 1u;
+        camera_set_keep_parity(s_cam, keep);
+        const char *msg = keep ? "BIT,14 (thermal phase)" : "BIT,8 (video phase)";
+        cdc_line(msg);
+        log_append(msg);
+        return ESP_OK;
+    }
+    if (strcmp(cmd, "PCK") == 0) {
+        /* LOCAL command: flip the PCLK sampling edge live (GPIO-matrix
+         * inversion) to hunt a clean data-valid window without a reflash.
+         * PCK,0 = rising edge, PCK,1 = falling edge, PCK alone = toggle. */
+        if (!s_cam) {
+            ESP_LOGW(TAG, "PCK: no camera context");
+            cdc_line("PCK: no camera context");
+            log_append("PCK: no camera context");
+            return ESP_ERR_INVALID_STATE;
+        }
+        bool inv;
+        if (val[0] == '0')      inv = false;
+        else if (val[0] == '1') inv = true;
+        else                    inv = !s_cam->pclk_invert;
+        camera_set_pclk_invert(s_cam, inv);
+        const char *msg = inv ? "PCK,1 (falling edge)" : "PCK,0 (rising edge)";
+        cdc_line(msg);
+        log_append(msg);
+        return ESP_OK;
+    }
+    /* Anything else is forwarded to the camera. camera_uart_send() logs the
+     * TX confirmation itself. */
+    return camera_uart_send(cmd, val[0] ? val : NULL);
 }
 
 /*
@@ -128,59 +317,7 @@ static void console_task(void *arg)
             }
             line[len] = '\0';
             len = 0;
-
-            /* Split into "CMD" and "value" at the first comma; strip spaces. */
-            char cmd[8] = {0}, val[40] = {0};
-            char *comma = strchr(line, ',');
-            const char *cs = line;
-            int ci = 0;
-            while (*cs && cs != comma && ci < (int)sizeof(cmd) - 1) {
-                if (!isspace((unsigned char)*cs)) cmd[ci++] = (char)toupper((unsigned char)*cs);
-                cs++;
-            }
-            if (comma) {
-                const char *vs = comma + 1;
-                int vi = 0;
-                while (*vs && vi < (int)sizeof(val) - 1) {
-                    /* values are uppercase letters or digits */
-                    if (!isspace((unsigned char)*vs)) val[vi++] = (char)toupper((unsigned char)*vs);
-                    vs++;
-                }
-            }
-
-            /* "BIT" is a LOCAL command (not sent to the camera): switch which
-             * interleaved phase is delivered. BIT,8 = 8-bit video (menu),
-             * BIT,14 = 14-bit thermal, BIT alone = toggle. */
-            if (strcmp(cmd, "BIT") == 0) {
-                if (s_cam) {
-                    uint32_t keep;
-                    if (strcmp(val, "8") == 0)        keep = 0;
-                    else if (strcmp(val, "14") == 0)  keep = 1;
-                    else                              keep = s_cam->keep_parity ? 0u : 1u;
-                    camera_set_keep_parity(s_cam, keep);
-                    cdc_line(keep ? "BIT,14 (thermal phase)" : "BIT,8 (video phase)");
-                } else {
-                    ESP_LOGW(TAG, "BIT: no camera context");
-                    cdc_line("BIT: no camera context");
-                }
-            } else if (strcmp(cmd, "PCK") == 0) {
-                /* LOCAL command: flip the PCLK sampling edge live (GPIO-matrix
-                 * inversion) to hunt a clean data-valid window without a reflash.
-                 * PCK,0 = rising edge, PCK,1 = falling edge, PCK alone = toggle. */
-                if (s_cam) {
-                    bool inv;
-                    if (val[0] == '0')      inv = false;
-                    else if (val[0] == '1') inv = true;
-                    else                    inv = !s_cam->pclk_invert;
-                    camera_set_pclk_invert(s_cam, inv);
-                    cdc_line(inv ? "PCK,1 (falling edge)" : "PCK,0 (rising edge)");
-                } else {
-                    ESP_LOGW(TAG, "PCK: no camera context");
-                    cdc_line("PCK: no camera context");
-                }
-            } else {
-                camera_uart_send(cmd, val[0] ? val : NULL);
-            }
+            camera_uart_submit_line(line);
         } else if (len < (int)sizeof(line) - 1) {
             line[len++] = (char)c;
         }
@@ -190,6 +327,13 @@ static void console_task(void *arg)
 esp_err_t camera_uart_start(camera_ctx_t *cam)
 {
     s_cam = cam;
+
+    s_log.mtx = xSemaphoreCreateMutex();
+    if (!s_log.mtx) {
+        ESP_LOGE(TAG, "log mutex alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     const uart_config_t cfg = {
         .baud_rate  = UART_BAUD,
         .data_bits  = UART_DATA_8_BITS,
