@@ -41,7 +41,13 @@ static uvc_stream_ctx_t *s_ctx;
 
 bool uvc_stream_is_active(void)
 {
-    return s_ctx && s_ctx->streaming;
+    /* streaming stays true forever with BULK UVC once a host has ever
+     * committed — there's no host-side uncommit. To distinguish "host is
+     * currently pulling" from "committed once, then app closed", also require
+     * a recent frame_xfer acceptance (uvc_host_consuming). Without this the
+     * RES,W,H handler stays permanently in host-owned mode after the first
+     * py-viewer session and can never apply a resolution change locally. */
+    return s_ctx && s_ctx->streaming && uvc_host_consuming();
 }
 
 /* ---- UVC callbacks ------------------------------------------------------ */
@@ -212,6 +218,16 @@ esp_err_t uvc_stream_init(uvc_stream_ctx_t *ctx)
 
     ESP_RETURN_ON_ERROR(uvc_device_config(0, &uvc_cfg), TAG, "UVC config failed");
     ESP_RETURN_ON_ERROR(uvc_device_init(),              TAG, "UVC init failed");
+
+    /* Start DVP capture right away so the web viewer works standalone before
+     * (or without) any UVC host ever committing. on_stream_start does its own
+     * stop→set→start when a host arrives, which is safe on an already-running
+     * capture (camera_start is idempotent — see the disable/enable dance). */
+    esp_err_t sr = camera_start(&ctx->camera);
+    if (sr != ESP_OK) {
+        ESP_LOGW(TAG, "boot camera_start: %s (deferred to first host commit)",
+                 esp_err_to_name(sr));
+    }
 
     ESP_LOGI(TAG, "Thermal bridge ready: %dx%d Y16 @%d fps, %d B/frame",
              THERMAL_WIDTH, THERMAL_HEIGHT, THERMAL_FPS, FRAME_BYTES);

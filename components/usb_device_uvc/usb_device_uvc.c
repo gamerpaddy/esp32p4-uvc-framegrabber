@@ -41,6 +41,35 @@ typedef struct {
 
 static uvc_device_t s_uvc_device;
 
+static inline uint32_t uvc_time_millis(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/*
+ * Host-activity signal (BULK UVC only). The video-class stream stays COMMITTED
+ * after the host app closes and TinyUSB never notifies on_stream_stop, so the
+ * app-level `streaming` flag isn't enough to tell whether pixels are actually
+ * flowing. Track the last time frame_xfer was ACCEPTED: everything downstream
+ * that wants to know "is the host really consuming right now?" checks this.
+ *   - uvc_stream_is_active() (uvc_streaming.c) uses it so RES,W,H commands
+ *     from the web can locally reconfigure the camera when the host has gone
+ *     idle — otherwise the resolution is stuck until the host reconnects.
+ *   - The task loop below itself slows the fb_get poll from 10 Hz to 2 Hz
+ *     once it's been idle for a while so a lower-priority web tap can either
+ *     get more frames (fewer refusal cycles hogging the CAM) or, when it
+ *     falls out of tap mode into direct-claim, isn't fighting a busy UVC.
+ */
+static volatile uint32_t s_last_accepted_ms;
+
+bool uvc_host_consuming(void)
+{
+    uint32_t last = s_last_accepted_ms;
+    /* Never accepted a frame → host has definitely never consumed. */
+    if (last == 0) return false;
+    return (uvc_time_millis() - last) < 500u;
+}
+
 static inline uint32_t get_time_millis(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
@@ -147,15 +176,25 @@ static void video_task(void *arg)
              * host — this refusal is the only signal. Drop the frame, back off
              * on the completion notify (wakes early if the stuck transfer
              * drains), and throttle the log to avoid 25 warnings/s.
+             *
+             * Once refusals have been going for a while, the host is genuinely
+             * idle (py viewer closed but bulk stayed committed). Sleep 500 ms
+             * instead of 100 ms — the CAM keeps running so the web viewer's
+             * observer tap sees consumers, but at 2 Hz the tap consistently
+             * times out and web falls into the direct-claim path at full
+             * 25 fps instead of being throttled to UVC's refusal rate.
              */
             s_uvc_device.user_config[0].fb_return_cb(pic, s_uvc_device.user_config[0].cb_ctx);
             static uint32_t refused = 0;
             if ((refused++ % 256u) == 0) {
                 ESP_LOGW(TAG, "frame_xfer refused (host idle?) — %" PRIu32 " frames dropped", refused);
             }
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+            uint32_t back_ms = uvc_host_consuming() ? 100u : 500u;
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(back_ms));
             continue;
         }
+        /* Transfer accepted — host is actively consuming. */
+        s_last_accepted_ms = uvc_time_millis();
 
         /* Block until tud_video_frame_xfer_complete_cb notifies us; bail out
          * if the host stops streaming mid-transfer, the task must exit, or

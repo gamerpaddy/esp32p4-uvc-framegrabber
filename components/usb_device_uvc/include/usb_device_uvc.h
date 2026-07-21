@@ -9,6 +9,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <sys/time.h>
 #include "esp_err.h"
 
@@ -102,6 +103,19 @@ esp_err_t uvc_device_deinit(void);
  * @param value Default value (must be within [min, max])
  */
 void uvc_xu_set_default(uint8_t cs, uint8_t value);
+
+/**
+ * @brief Whether a UVC host is CURRENTLY pulling frames.
+ *
+ * Distinct from "streaming committed": with the BULK video stream the interface
+ * stays COMMITTED after the host app closes (there is no host-side "uncommit"),
+ * so stop_cb is never called and streaming stays true forever. This helper
+ * looks at whether frame_xfer has been ACCEPTED recently (500 ms window) — the
+ * only signal available to distinguish an active host from a stale bulk
+ * commitment. Used by the RES,W,H handler and web viewer to decide whether the
+ * resolution/pipeline is truly host-owned right now.
+ */
+bool uvc_host_consuming(void);
 
 #ifdef __cplusplus
 }
